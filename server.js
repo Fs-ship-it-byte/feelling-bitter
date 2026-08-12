@@ -44,9 +44,36 @@ app.get('/debug/vidurl', async (req, res) => {
         log.push(`Content-Type: ${resp.headers['content-type']}`);
         log.push(`Headers completos: ${JSON.stringify(resp.headers, null, 2)}`);
         log.push('');
-        log.push('--- BODY (primeros 3000 caracteres) ---');
+
         const bodyStr = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data, null, 2);
-        log.push(bodyStr.slice(0, 3000));
+        log.push(`Largo total del body: ${bodyStr.length} caracteres`);
+        log.push('');
+
+        // Buscamos patrones típicos de reproductor/video en TODO el body,
+        // no solo en los primeros caracteres (el <head> con metadatos tapa
+        // la parte real del player).
+        const patterns = {
+            'm3u8 directo': /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi,
+            'mp4 directo': /https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/gi,
+            'sources: [...]': /sources\s*:\s*\[[^\]]*\]/gi,
+            'file: "..."': /file\s*:\s*["'][^"']+["']/gi,
+            'iframe src': /<iframe[^>]+src=["']([^"']+)["']/gi,
+            'vidhide/embedwish/etc': /https?:\/\/[^\s"'<>]*(vidhide|embedwish|streamwish|filelions|hglink|filemoon)[^\s"'<>]*/gi,
+            'jwplayer setup': /jwplayer\([^)]*\)\.setup\(/gi,
+            'eval(function(p,a,c,k,e': /eval\(function\(p,a,c,k,e/gi,
+        };
+
+        for (const [label, regex] of Object.entries(patterns)) {
+            const matches = bodyStr.match(regex);
+            if (matches) {
+                log.push(`--- Encontrado "${label}" (${matches.length} match(es)) ---`);
+                matches.slice(0, 5).forEach(m => log.push('  ' + m.slice(0, 300)));
+            }
+        }
+
+        log.push('');
+        log.push('--- BODY COMPLETO ---');
+        log.push(bodyStr);
     } catch (e) {
         log.push(`ERROR: ${e.message}`);
         if (e.response) {
