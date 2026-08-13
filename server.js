@@ -3,6 +3,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 
 const app = express();
+const PUBLIC_URL = (process.env.PUBLIC_URL || `http://127.0.0.1:${process.env.PORT || 7000}`).replace(/\/+$/, '');
 const BASE = 'https://pelispedia.mov';
 const PS_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -228,6 +229,135 @@ async function resolveByServer(servername, embedUrl) {
     console.log(`[Resolvers] Servidor sin resolver implementado: ${servername}`);
     return null;
 }
+
+// ==========================================
+// 2b) PROXY DE HLS (m3u8 + segmentos)
+// ==========================================
+// Por qué existe esto: los master.m3u8 de estos CDN (acek-cdn.com y
+// similares) llevan un token atado a la IP/headers que lo negoció. Si le
+// entregamos esa URL cruda al reproductor (VLC, Stremio en el celular/TV),
+// la petición sale desde OTRA IP y el CDN la rechaza aunque los headers
+// estén bien puestos. Solución: nuestro propio servidor reproxea TODO
+// (m3u8 y cada segmento), siempre con la misma IP/headers, y el reproductor
+// solo habla con nosotros.
+
+function encodeProxyToken(url, headers) {
+    return Buffer.from(JSON.stringify({ url, headers: headers || {} }), 'utf8').toString('base64url');
+}
+function decodeProxyToken(token) {
+    try { return JSON.parse(Buffer.from(token, 'base64url').toString('utf8')); }
+    catch (e) { return null; }
+}
+function makeAbsoluteUrl(url, base) {
+    if (!url) return null;
+    if (/^https?:\/\//i.test(url)) return url;
+    if (url.indexOf('//') === 0) return 'https:' + url;
+    if (url.indexOf('/') === 0) {
+        try { return new URL(base).origin + url; } catch (e) { return base + url; }
+    }
+    return base + '/' + url;
+}
+
+// Hosts típicos de redes de publicidad que a veces se "empalman" como si
+// fueran segmentos de video reales dentro del m3u8.
+const AD_HOST_PATTERNS = [/tiktokcdn\.com$/i, /doubleclick\.net$/i, /googlesyndication\.com$/i, /^ads?\./i];
+function looksLikeAdUrl(u) {
+    try {
+        const host = new URL(u).host;
+        return AD_HOST_PATTERNS.some(rx => rx.test(host)) || /ad-site|\/ads?\//i.test(u);
+    } catch (e) { return false; }
+}
+
+// No decidimos "sub-playlist vs segmento" por la extensión del archivo
+// (algunos sitios nombran sus sub-playlists con ".txt"), sino por la
+// etiqueta que las precede en el propio m3u8: #EXT-X-STREAM-INF siempre
+// indica que la línea siguiente es una sub-playlist.
+function isM3u8Url(u) { return /\.m3u8(\?|#|$)/i.test(u); }
+
+function rewriteM3u8(playlistText, baseUrl, headers) {
+    const lines = playlistText.split(/\r?\n/);
+    let nextIsPlaylist = false;
+    const out = [];
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) { out.push(line); continue; }
+
+        if (trimmed.startsWith('#')) {
+            const upper = trimmed.toUpperCase();
+            if (upper.startsWith('#EXT-X-I-FRAME-STREAM-INF')) {
+                out.push(line.replace(/URI="([^"]+)"/i, (m, uri) => {
+                    const abs = makeAbsoluteUrl(uri, baseUrl.replace(/\/[^/]*$/, ''));
+                    const token = encodeProxyToken(abs, headers);
+                    return `URI="${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8"`;
+                }));
+                continue;
+            }
+            out.push(line.replace(/URI="([^"]+)"/i, (m, uri) => {
+                const abs = makeAbsoluteUrl(uri, baseUrl.replace(/\/[^/]*$/, ''));
+                const token = encodeProxyToken(abs, headers);
+                return `URI="${PUBLIC_URL}/hlsproxy/segment/${token}/seg"`;
+            }));
+            nextIsPlaylist = upper.startsWith('#EXT-X-STREAM-INF');
+            continue;
+        }
+
+        const absUrl = /^https?:\/\//i.test(trimmed) ? trimmed : makeAbsoluteUrl(trimmed, baseUrl.replace(/\/[^/]*$/, ''));
+        const isPlaylist = nextIsPlaylist || isM3u8Url(absUrl);
+        nextIsPlaylist = false;
+
+        if (!isPlaylist && looksLikeAdUrl(absUrl)) {
+            if (out.length > 0 && out[out.length - 1].trim().toUpperCase().startsWith('#EXTINF')) out.pop();
+            continue;
+        }
+
+        const token = encodeProxyToken(absUrl, headers);
+        out.push(isPlaylist
+            ? `${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`
+            : `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`);
+    }
+    return out.join('\n');
+}
+
+async function handleHlsPlaylistProxy(req, res) {
+    const data = decodeProxyToken(req.params.token);
+    if (!data) return res.status(400).send('Token inválido');
+    try {
+        const upstream = await axios.get(data.url, {
+            headers: data.headers, timeout: 15000, responseType: 'text',
+            transformResponse: [(d) => d]
+        });
+        const rewritten = rewriteM3u8(upstream.data, data.url, data.headers);
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Content-Type', 'application/vnd.apple.mpegurl');
+        res.send(rewritten);
+    } catch (e) {
+        res.status(502).send('No se pudo obtener el playlist: ' + e.message);
+    }
+}
+
+async function handleHlsSegmentProxy(req, res) {
+    const data = decodeProxyToken(req.params.token);
+    if (!data) return res.status(400).send('Token inválido');
+    try {
+        const upstream = await axios.get(data.url, {
+            headers: data.headers, timeout: 20000, responseType: 'stream'
+        });
+        res.set('Access-Control-Allow-Origin', '*');
+        if (upstream.headers['content-type']) res.set('Content-Type', upstream.headers['content-type']);
+        upstream.data.pipe(res);
+    } catch (e) {
+        res.status(502).send('No se pudo obtener el segmento');
+    }
+}
+
+function buildProxyPlaylistUrl(targetUrl, headers) {
+    const token = encodeProxyToken(targetUrl, headers);
+    return `${PUBLIC_URL}/hlsproxy/playlist/${token}/master.m3u8`;
+}
+
+app.get('/hlsproxy/playlist/:token/*', handleHlsPlaylistProxy);
+app.get('/hlsproxy/segment/:token/*', handleHlsSegmentProxy);
 
 // ==========================================
 // 3) ENDPOINT DE STREAMING
