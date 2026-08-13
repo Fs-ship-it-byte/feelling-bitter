@@ -388,11 +388,13 @@ app.get('/stream/:type/:idWithExt', async (req, res) => {
         const resolved = await Promise.all(embeds.map(async (e) => {
             const r = await resolveByServer(e.servername, e.embedUrl);
             if (!r) return null;
+            // No le pasamos la URL cruda del CDN al reproductor -- el token
+            // del m3u8 queda atado a la IP/headers con los que nuestro
+            // servidor lo negoció. Todo pasa por nuestro propio proxy.
             return {
                 name: `PelisPedia - ${e.servername}`,
                 title: `${e.language} - ${e.servername}`,
-                url: r.url,
-                behaviorHints: { notWebReady: true, proxyHeaders: { request: r.headers } }
+                url: buildProxyPlaylistUrl(r.url, r.headers)
             };
         }));
 
@@ -415,6 +417,49 @@ app.get('/debug/embeds', async (req, res) => {
         res.send(JSON.stringify(embeds, null, 2));
     } catch (e) {
         res.status(500).send('Error: ' + e.message);
+    }
+});
+
+// --- DIAGNÓSTICO: seguir la cadena completa master -> sub-playlist -> segmento ---
+app.get('/debug/fullchain', async (req, res) => {
+    const masterUrl = req.query.url;
+    if (!masterUrl) return res.status(400).send('Falta ?url=');
+    res.set('Content-Type', 'text/plain');
+    const log = [];
+    const t0 = Date.now();
+    const p = (msg) => log.push(`[${Date.now() - t0}ms] ${msg}`);
+
+    async function fetchText(u) {
+        return axios.get(u, { timeout: 12000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true });
+    }
+    async function fetchBinary(u) {
+        return axios.get(u, { timeout: 12000, responseType: 'arraybuffer', validateStatus: () => true });
+    }
+
+    try {
+        const masterResp = await fetchText(masterUrl);
+        p(`MASTER status ${masterResp.status}, largo ${String(masterResp.data).length}`);
+        if (masterResp.status !== 200) return res.send(log.join('\n') + '\n\nBody:\n' + String(masterResp.data).slice(0, 500));
+
+        const subLine = String(masterResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
+        if (!subLine) return res.send(log.join('\n') + '\n\nEl master no tiene sub-playlist.');
+        p(`Sub-playlist: ${subLine.trim()}`);
+
+        const subResp = await fetchText(subLine.trim());
+        p(`SUB-PLAYLIST status ${subResp.status}, largo ${String(subResp.data).length}`);
+        if (subResp.status !== 200) return res.send(log.join('\n') + '\n\nBody:\n' + String(subResp.data).slice(0, 500));
+        p('Primeros 300 chars de la sub-playlist:\n' + String(subResp.data).slice(0, 300));
+
+        const segLine = String(subResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
+        if (!segLine) return res.send(log.join('\n') + '\n\nSin segmentos.');
+        p(`Primer segmento: ${segLine.trim()}`);
+
+        const segResp = await fetchBinary(segLine.trim());
+        p(`SEGMENTO status ${segResp.status}, bytes: ${segResp.data ? segResp.data.byteLength : 0}`);
+        res.send(log.join('\n'));
+    } catch (e) {
+        p('EXCEPCIÓN: ' + e.message);
+        res.status(500).send(log.join('\n'));
     }
 });
 
