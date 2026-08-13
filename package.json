@@ -1,7 +1,7 @@
 {
   "name": "pelispedia-standalone",
   "version": "1.0.0",
-  "description": "Addon standalone para pelispedia.mov (fase de diagnóstico)",
+  "description": "Addon standalone para pelispedia.mov (vía embed69, con PoW+AES)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
