@@ -221,207 +221,11 @@ async function resolveVoe(url) {
     }
 }
 
-// ==========================================
-// 2c) RESPALDO CON NAVEGADOR (Puppeteer)
-// ==========================================
-// StreamWish tiene protección anti-devtools (un debugger; en loop que pausa
-// la ejecución si hay un debugger real conectado) y a veces necesita JS real
-// para revelar el m3u8. VOE, además, pide resolver un captcha Altcha (un
-// checkbox que dispara una prueba de trabajo del lado del cliente) antes de
-// arrancar el reproductor. axios no ejecuta JS, así que ninguno de los dos
-// casos se puede resolver sin un navegador real -- lo usamos SOLO como
-// respaldo, cuando el método rápido (sin navegador) no encuentra nada.
-
-let puppeteer = null;
-try { puppeteer = require('puppeteer'); } catch (e) { /* opcional */ }
-
-let _browserInstance = null;
-async function getBrowser() {
-    if (!puppeteer) throw new Error('puppeteer no está instalado');
-    if (_browserInstance && _browserInstance.isConnected()) return _browserInstance;
-    const launchOpts = {
-        headless: 'new',
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-    };
-    if (process.env.PUPPETEER_EXECUTABLE_PATH) launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    _browserInstance = await puppeteer.launch(launchOpts);
-    return _browserInstance;
-}
-
-async function resolveViaBrowser(embedUrl, timeoutMs) {
-    timeoutMs = timeoutMs || 30000;
-    if (!puppeteer) return null;
-
-    let browser, page, onTargetCreated;
-    try {
-        browser = await getBrowser();
-        page = await browser.newPage();
-        await page.setUserAgent(PS_UA);
-        await page.setRequestInterception(true);
-        page.setDefaultTimeout(timeoutMs);
-        page.setDefaultNavigationTimeout(timeoutMs);
-
-        // Diálogos JS (alert/confirm/prompt) sin atender bloquean cualquier
-        // click/evaluate posterior -- los cerramos apenas aparecen.
-        page.on('dialog', async (dialog) => { try { await dialog.dismiss(); } catch (e) {} });
-
-        let resolved = null;
-        let pageOrigin = null;
-        try { pageOrigin = new URL(embedUrl).origin; } catch (e) {}
-        let lastReferer = 'https://www.google.com/';
-
-        function originFromReferer(referer) {
-            if (referer) { try { return new URL(referer).origin; } catch (e) {} }
-            return pageOrigin;
-        }
-
-        onTargetCreated = async (target) => {
-            try {
-                if (target.opener() === page.target()) {
-                    const popup = await target.page();
-                    if (popup) await popup.close();
-                }
-            } catch (e) {}
-        };
-        browser.on('targetcreated', onTargetCreated);
-
-        page.on('request', (req) => {
-            const url = req.url();
-            const type = req.resourceType();
-            const urlLower = url.toLowerCase();
-            const AD_KEYWORDS = ['/ads/', 'vast', 'vpaid', 'popads', 'popcash', 'pop.', 'tracker', 'analytics', 'doubleclick', 'adservice', 'adsystem'];
-            if (AD_KEYWORDS.some((kw) => urlLower.includes(kw))) { req.abort(); return; }
-            if (type === 'image' || type === 'font') { req.abort(); return; }
-            if (!resolved && type !== 'document' && (/\.m3u8(\?|$)/i.test(url) || /master\.json(\?|$)/i.test(url))) {
-                resolved = {
-                    url,
-                    headers: {
-                        Referer: req.headers()['referer'] || lastReferer,
-                        Origin: originFromReferer(req.headers()['referer'] || lastReferer),
-                        'User-Agent': PS_UA
-                    }
-                };
-            }
-            if (!resolved && type === 'media' && /\.mp4(\?|$)/i.test(url)) {
-                resolved = {
-                    url,
-                    headers: {
-                        Referer: req.headers()['referer'] || lastReferer,
-                        Origin: originFromReferer(req.headers()['referer'] || lastReferer),
-                        'User-Agent': PS_UA
-                    }
-                };
-            }
-            req.continue();
-        });
-
-        page.on('response', (resp) => {
-            if (resolved) return;
-            try {
-                const ct = resp.headers()['content-type'] || '';
-                const rUrl = resp.url();
-                if (/mpegurl|vnd\.apple\.mpegurl|dash\+xml/i.test(ct) || /^video\/mp4/i.test(ct)) {
-                    resolved = {
-                        url: rUrl,
-                        headers: {
-                            Referer: resp.request().headers()['referer'] || lastReferer,
-                            Origin: originFromReferer(resp.request().headers()['referer'] || lastReferer),
-                            'User-Agent': PS_UA
-                        }
-                    };
-                }
-            } catch (e) {}
-        });
-
-        page.on('framenavigated', (frame) => {
-            if (frame === page.mainFrame()) lastReferer = frame.url();
-        });
-
-        try {
-            await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: timeoutMs, referer: 'https://www.google.com/' });
-        } catch (e) { /* seguimos igual, puede que ya haya resuelto durante la navegación */ }
-
-        try {
-            const title = await page.title();
-            if (/no encontrada|not found|404/i.test(title)) return null;
-        } catch (e) {}
-
-        const viewport = page.viewport() || { width: 1280, height: 720 };
-        const centerX = Math.floor(viewport.width / 2);
-        const centerY = Math.floor(viewport.height / 2);
-
-        // Clic agresivo sobre la página y CADA iframe hijo, más el checkbox
-        // de Altcha (VOE) si está presente -- el widget resuelve su propia
-        // prueba de trabajo solo con que quede marcado, no hace falta
-        // resolverla nosotros.
-        async function tryClickEverywhere() {
-            try { await page.mouse.click(centerX, centerY); } catch (e) {}
-            const selectors = [
-                'video', '.jw-icon-playback', '.vjs-big-play-button', '.play-button',
-                '#player', '.plyr__control--overlaid', '.vjs-play-control',
-                'input[type="checkbox"][id^="altcha-checkbox"]',
-                '.altcha-checkbox', '[class*="altcha"] input[type="checkbox"]',
-                '[id="start"]', 'img[src*="play"]', '[onclick*="play"]'
-            ];
-            const frames = page.frames();
-            for (const frame of frames) {
-                try {
-                    await frame.evaluate((sels) => {
-                        for (const s of sels) {
-                            const el = document.querySelector(s);
-                            if (el) {
-                                try {
-                                    if (el.type === 'checkbox' && !el.checked) el.click();
-                                    else el.click();
-                                } catch (e) {}
-                            }
-                        }
-                        const video = document.querySelector('video');
-                        if (video) { try { video.muted = true; video.play().catch(() => {}); } catch (e) {} }
-                    }, selectors);
-                } catch (e) {}
-            }
-        }
-
-        const start = Date.now();
-        let lastClickAt = 0;
-        while (!resolved && Date.now() - start < timeoutMs) {
-            if (Date.now() - lastClickAt > 1500) {
-                lastClickAt = Date.now();
-                await tryClickEverywhere();
-            }
-            await new Promise((r) => setTimeout(r, 300));
-        }
-
-        return resolved;
-    } catch (e) {
-        console.log('[Puppeteer] Error:', e.message);
-        return null;
-    } finally {
-        if (browser && onTargetCreated) { try { browser.off('targetcreated', onTargetCreated); } catch (e) {} }
-        if (page) { try { await page.close(); } catch (e) {} }
-    }
-}
-
 async function resolveByServer(servername, embedUrl) {
     const name = (servername || '').toLowerCase();
-
     if (name === 'vidhide') return resolveVidHide(embedUrl);
-
-    if (name === 'streamwish') {
-        const quick = await resolveStreamWish(embedUrl);
-        if (quick) return quick;
-        console.log('[StreamWish] Método rápido no encontró nada, probando con navegador...');
-        return resolveViaBrowser(embedUrl);
-    }
-
-    if (name === 'voe') {
-        const quick = await resolveVoe(embedUrl);
-        if (quick) return quick;
-        console.log('[VOE] Método rápido no encontró nada, probando con navegador (Altcha)...');
-        return resolveViaBrowser(embedUrl);
-    }
-
+    if (name === 'streamwish') return resolveStreamWish(embedUrl);
+    if (name === 'voe') return resolveVoe(embedUrl);
     console.log(`[Resolvers] Servidor sin resolver implementado: ${servername}`);
     return null;
 }
@@ -573,14 +377,13 @@ app.get('/manifest.json', (req, res) => {
 });
 
 app.get('/stream/:type/:idWithExt', async (req, res) => {
-    const t0 = Date.now();
     try {
         const id = req.params.idWithExt.replace(/\.json$/, '');
         const [imdbId, season, episode] = id.split(':');
         console.log(`--- Pedido: ${req.params.type} ${id} ---`);
 
         const embeds = await getDecryptedEmbeds(imdbId, season, episode);
-        console.log(`[${Date.now() - t0}ms] Embeds descifrados: ${embeds.length} (${embeds.map(e => e.servername).join(', ')})`);
+        console.log(`Embeds descifrados: ${embeds.length} (${embeds.map(e => e.servername).join(', ')})`);
 
         const resolved = await Promise.all(embeds.map(async (e) => {
             const r = await resolveByServer(e.servername, e.embedUrl);
@@ -596,7 +399,7 @@ app.get('/stream/:type/:idWithExt', async (req, res) => {
         }));
 
         const streams = resolved.filter(Boolean);
-        console.log(`[${Date.now() - t0}ms] Streams resueltos: ${streams.length} (tiempo total de esta respuesta)`);
+        console.log(`Streams resueltos: ${streams.length}`);
         res.json({ streams });
     } catch (e) {
         console.log('Error en /stream:', e.message);
@@ -668,10 +471,3 @@ const port = process.env.PORT || 7000;
 app.listen(port, () => {
     console.log(`PelisPedia standalone escuchando en puerto ${port}`);
 });
-
-async function shutdown() {
-    if (_browserInstance) { try { await _browserInstance.close(); } catch (e) {} }
-    process.exit(0);
-}
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
