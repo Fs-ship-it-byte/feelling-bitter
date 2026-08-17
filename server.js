@@ -377,13 +377,14 @@ app.get('/manifest.json', (req, res) => {
 });
 
 app.get('/stream/:type/:idWithExt', async (req, res) => {
+    const t0 = Date.now();
     try {
         const id = req.params.idWithExt.replace(/\.json$/, '');
         const [imdbId, season, episode] = id.split(':');
         console.log(`--- Pedido: ${req.params.type} ${id} ---`);
 
         const embeds = await getDecryptedEmbeds(imdbId, season, episode);
-        console.log(`Embeds descifrados: ${embeds.length} (${embeds.map(e => e.servername).join(', ')})`);
+        console.log(`[${Date.now() - t0}ms] Embeds descifrados: ${embeds.length} (${embeds.map(e => e.servername).join(', ')})`);
 
         const resolved = await Promise.all(embeds.map(async (e) => {
             const r = await resolveByServer(e.servername, e.embedUrl);
@@ -399,7 +400,7 @@ app.get('/stream/:type/:idWithExt', async (req, res) => {
         }));
 
         const streams = resolved.filter(Boolean);
-        console.log(`Streams resueltos: ${streams.length}`);
+        console.log(`[${Date.now() - t0}ms] Streams resueltos: ${streams.length} (tiempo total de esta respuesta)`);
         res.json({ streams });
     } catch (e) {
         console.log('Error en /stream:', e.message);
