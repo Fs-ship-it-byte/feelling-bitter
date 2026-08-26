@@ -125,12 +125,30 @@ async function resolveVidHide(url) {
                 if (hlsMatch) finalUrl = hlsMatch[1];
             }
         }
+        let fromRawFallback = false;
         if (!finalUrl) {
-            const rawMatch = html.match(/"hls[24]"\s*:\s*"([^"]+)"/) || html.match(/file\s*:\s*["']([^"']+)["']/i);
-            if (rawMatch) finalUrl = rawMatch[1];
+            const rawMatch = html.match(/"hls[24]"\s*:\s*"([^"]+)"/);
+            if (rawMatch) {
+                finalUrl = rawMatch[1];
+            } else {
+                const fileMatch = html.match(/file\s*:\s*["']([^"']+)["']/i);
+                if (fileMatch) { finalUrl = fileMatch[1]; fromRawFallback = true; }
+            }
         }
         if (!finalUrl) return null;
         if (!finalUrl.startsWith('http')) finalUrl = new URL(url).origin + finalUrl;
+
+        // El fallback "file:" es un regex genérico que a veces agarra un link
+        // suelto del propio dominio del embed (sin token de CDN firmado) en
+        // vez del m3u8 real -- esos links suelen fallar al reproducir o
+        // vencer casi al instante. Si pasa esto, mejor no lo demos por bueno.
+        if (fromRawFallback && !isM3u8Url(finalUrl)) {
+            console.log(`[VidHide] Descartado link sospechoso del fallback "file:" (no es .m3u8): ${finalUrl}`);
+            return null;
+        }
+        if (fromRawFallback && new URL(finalUrl).hostname === domain) {
+            console.log(`[VidHide] Fallback "file:" apunta al mismo dominio del embed (${domain}), probablemente no es el CDN real: ${finalUrl}`);
+        }
 
         return {
             url: finalUrl,
@@ -521,13 +539,20 @@ async function handleHlsPlaylistProxy(req, res) {
     try {
         const upstream = await axios.get(data.url, {
             headers: data.headers, timeout: 15000, responseType: 'text',
-            transformResponse: [(d) => d]
+            transformResponse: [(d) => d], validateStatus: () => true
         });
+        if (upstream.status !== 200 || !String(upstream.data).includes('#EXTM3U')) {
+            console.log(`[hlsproxy] Playlist upstream falló. url=${data.url} status=${upstream.status} body(200)=${String(upstream.data).slice(0, 200)}`);
+            return res.status(502).send(
+                `Upstream no devolvió un m3u8 válido.\nStatus: ${upstream.status}\nURL: ${data.url}\nBody: ${String(upstream.data).slice(0, 300)}`
+            );
+        }
         const rewritten = rewriteM3u8(upstream.data, data.url, data.headers);
         res.set('Access-Control-Allow-Origin', '*');
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewritten);
     } catch (e) {
+        console.log(`[hlsproxy] Excepción en playlist proxy. url=${data.url} error=${e.message}`);
         res.status(502).send('No se pudo obtener el playlist: ' + e.message);
     }
 }
@@ -537,8 +562,13 @@ async function handleHlsSegmentProxy(req, res) {
     if (!data) return res.status(400).send('Token inválido');
     try {
         const upstream = await axios.get(data.url, {
-            headers: data.headers, timeout: 20000, responseType: 'stream'
+            headers: data.headers, timeout: 20000, responseType: 'stream',
+            validateStatus: () => true
         });
+        if (upstream.status !== 200) {
+            console.log(`[hlsproxy] Segmento upstream falló. url=${data.url} status=${upstream.status}`);
+            return res.status(502).send(`Upstream devolvió status ${upstream.status} para el segmento: ${data.url}`);
+        }
         res.set('Access-Control-Allow-Origin', '*');
         if (upstream.headers['content-type']) res.set('Content-Type', upstream.headers['content-type']);
         upstream.data.pipe(res);
