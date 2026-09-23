@@ -401,16 +401,14 @@ async function resolveByServer(servername, embedUrl) {
 
     if (name === 'vidhide') {
         const quick = await resolveVidHide(embedUrl);
-        if (quick && await validateHlsCandidate(quick.url, quick.headers)) return quick;
-        if (quick) console.log(`[VidHide] Resultado rápido no pasó la validación, descartado: ${quick.url}`);
+        if (quick) return quick;
         return resolveViaBrowser(embedUrl);
     }
 
     if (name === 'streamwish') {
         const quick = await resolveStreamWish(embedUrl);
-        if (quick && await validateHlsCandidate(quick.url, quick.headers)) return quick;
-        if (quick) console.log(`[StreamWish] Resultado rápido no pasó la validación, descartado: ${quick.url}`);
-        else console.log('[StreamWish] Método rápido no encontró nada, probando con navegador...');
+        if (quick) return quick;
+        console.log('[StreamWish] Método rápido no encontró nada, probando con navegador...');
         return resolveViaBrowser(embedUrl);
     }
 
@@ -458,60 +456,38 @@ function isSuspiciousSegmentUrl(u) {
         const parsed = new URL(u);
         const host = parsed.hostname.toLowerCase();
         const pathname = parsed.pathname.toLowerCase();
+        // Solo hosts de redes de publicidad/tracking CONOCIDAS. No filtramos
+        // por extensión (.jpg/.png/etc.) -- varios CDNs de video legítimos
+        // (como morencius.com, usado por PelisPedia) disfrazan sus segmentos
+        // reales con extensiones de imagen para evadir bloqueadores, y ese
+        // chequeo genérico terminaba marcando el 100% del contenido real
+        // como "sospechoso", tumbando todos los streams.
         if (host === 'tiktokcdn.com' || host.endsWith('.tiktokcdn.com')) return true;
-        if (pathname.endsWith('.image') || pathname.indexOf('/ad-site-') !== -1) return true;
-        if (/\.(png|jpg|jpeg|webp|gif|svg|avif)$/i.test(pathname)) return true;
+        if (host === 'doubleclick.net' || host.endsWith('.doubleclick.net')) return true;
+        if (host === 'googlesyndication.com' || host.endsWith('.googlesyndication.com')) return true;
+        if (pathname.indexOf('/ad-site-') !== -1) return true;
         return false;
     } catch (e) { return false; }
 }
 
-async function validateHlsCandidate(candidateUrl, headers, depth) {
-    depth = depth || 0;
-    if (depth > 3) return null;
-    if (isSuspiciousSegmentUrl(candidateUrl)) return null;
-
-    let text;
+// ==========================================
+// DETECCIÓN DE HOST DE ADS (solo hosts confirmados, sin fetch extra)
+// ==========================================
+// Nada de pre-validar el candidato bajándolo de nuevo: esas URLs traen
+// tokens firmados de vida corta (t=...&s=...&e=...) y algunos son de un
+// solo uso -- hacer una petición extra "para validar" quema el token o
+// dispara un rechazo del CDN por motivos que no tienen nada que ver con
+// publicidad, tumbando streams 100% legítimos (visto con morencius.com y
+// acek-cdn.com). En vez de eso, se confía en lo que el resolver ya extrajo
+// del sitio real, y el filtrado de ads se hace después, por SEGMENTO
+// individual y solo por host confirmado como red de publicidad -- nunca
+// se descarta el playlist completo por esto.
+const AD_HOSTS = [/(^|\.)tiktokcdn\.com$/i, /(^|\.)doubleclick\.net$/i, /(^|\.)googlesyndication\.com$/i];
+function isKnownAdHost(u) {
     try {
-        const r = await axios.get(candidateUrl, {
-            headers, timeout: 10000, responseType: 'text',
-            transformResponse: [(d) => d]
-        });
-        text = r.data;
-    } catch (e) { return null; }
-
-    if (typeof text !== 'string' || !text.trimStart().startsWith('#EXTM3U')) return null;
-    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-
-    if (text.indexOf('#EXT-X-STREAM-INF') !== -1) {
-        let bestUrl = null, bestScore = -1;
-        for (let i = 0; i < lines.length; i++) {
-            if (lines[i].indexOf('#EXT-X-STREAM-INF') === -1) continue;
-            const resM = /RESOLUTION=(\d+)x(\d+)/i.exec(lines[i]);
-            const score = resM ? Number(resM[1]) * Number(resM[2]) : 0;
-            for (let j = i + 1; j < lines.length; j++) {
-                if (lines[j].startsWith('#')) continue;
-                const variant = new URL(lines[j], candidateUrl).href;
-                if (score > bestScore) { bestScore = score; bestUrl = variant; }
-                break;
-            }
-        }
-        if (!bestUrl) return null;
-        return validateHlsCandidate(bestUrl, headers, depth + 1);
-    }
-
-    const segLines = lines.filter((l) => !l.startsWith('#'));
-    if (segLines.length === 0) return null;
-    const sample = segLines.slice(0, 10);
-    let suspiciousCount = 0;
-    for (const seg of sample) {
-        const segUrl = new URL(seg, candidateUrl).href;
-        if (isSuspiciousSegmentUrl(segUrl)) suspiciousCount++;
-    }
-    if (suspiciousCount === sample.length) {
-        console.log('[HLS-VALIDATE] candidato rechazado, todos los segmentos de muestra son sospechosos (señuelo completo):', candidateUrl);
-        return null;
-    }
-    return candidateUrl;
+        const host = new URL(u).hostname.toLowerCase();
+        return AD_HOSTS.some((rx) => rx.test(host)) || u.toLowerCase().indexOf('/ad-site-') !== -1;
+    } catch (e) { return false; }
 }
 
 function isM3u8Url(u) { return /\.m3u8(\?|#|$)/i.test(u); }
