@@ -490,7 +490,11 @@ function isKnownAdHost(u) {
     } catch (e) { return false; }
 }
 
-function isM3u8Url(u) { return /\.m3u8(\?|#|$)/i.test(u); }
+// StreamWish ahora nombra sus playlists .txt (master.txt, index-v1-a1.txt,
+// iframes-v1-a1.txt) y sus segmentos .woff2. Las .txt se tratan igual que las
+// .m3u8 (playlist -> proxy liviano, se reescribe); los .woff2 no son playlist,
+// así que siguen el camino de cualquier segmento (directo al CDN).
+function isM3u8Url(u) { return /\.(m3u8|txt)(\?|#|$)/i.test(u); }
 
 // USE_PROXY=1 -> proxy completo (TODO pasa por nuestro server, incluidos
 //   los segmentos .ts -- máxima compatibilidad, máximo gasto de banda).
@@ -540,7 +544,10 @@ function rewriteM3u8(playlistText, baseUrl, headers) {
             const token = encodeProxyToken(absUrl, headers);
             return `${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`;
         }
-        if (USE_PROXY) {
+        // Con USE_PROXY=1 el segmento pasa por nuestro server, salvo los de
+        // hosts de publicidad conocidos (p.ej. tiktokcdn .image): esos van
+        // directo para gastar lo mínimo.
+        if (USE_PROXY && !isKnownAdHost(absUrl)) {
             const token = encodeProxyToken(absUrl, headers);
             return `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`;
         }
