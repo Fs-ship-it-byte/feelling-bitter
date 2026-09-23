@@ -279,9 +279,27 @@ async function _resolveViaBrowserInner(embedUrl, timeoutMs) {
         page.on('request', (req) => {
             const url = req.url();
             const type = req.resourceType();
-            const urlLower = url.toLowerCase();
-            const AD_KEYWORDS = ['/ads/', 'vast', 'vpaid', 'popads', 'popcash', 'pop.', 'tracker', 'analytics', 'doubleclick', 'adservice', 'adsystem'];
-            if (AD_KEYWORDS.some((kw) => urlLower.includes(kw))) { req.abort(); return; }
+
+            // Antes: substrings libres sobre la URL entera (ej: 'pop.',
+            // 'tracker') podían matchear por accidente el propio CDN de
+            // video real (un subdominio tipo "cdn-pop3.xxx.com", o un
+            // parámetro de query con esas letras) y abortar el request que
+            // buscábamos. Ahora chequeamos con límites de palabra sobre el
+            // hostname (para lo que es claramente un dominio de
+            // publicidad/tracking) y patrones de PATH específicos por
+            // separado (para rutas de ads dentro de un host que puede ser
+            // legítimo).
+            let host = '';
+            try { host = new URL(url).hostname.toLowerCase(); } catch (e) {}
+            const pathAndQuery = url.toLowerCase().replace(/^https?:\/\/[^/]+/, '');
+
+            const AD_HOST_WORDS = /(^|\.)(ads?|adservice|adsystem|doubleclick|popads|popcash|analytics|tracker|trk)\./i;
+            const AD_PATH_PATTERNS = /\/ads\/|[?&](vast|vpaid)[=&]|\/vast[/?]|\/vpaid[/?]/i;
+
+            if (AD_HOST_WORDS.test(host) || AD_PATH_PATTERNS.test(pathAndQuery)) {
+                req.abort();
+                return;
+            }
             if (type === 'image' || type === 'font') { req.abort(); return; }
             if (!resolved && type !== 'document' && (/\.m3u8(\?|$)/i.test(url) || /master\.json(\?|$)/i.test(url))) {
                 resolved = {
@@ -837,7 +855,22 @@ app.get('/debug/fullchain', async (req, res) => {
         p(`Primer segmento: ${segLine}`);
 
         const segResp = await fetchBinary(segLine);
-        p(`SEGMENTO status ${segResp.status}, bytes: ${segResp.data ? segResp.data.byteLength : 0}`);
+        p(`SEGMENTO CON headers -> status ${segResp.status}, bytes: ${segResp.data ? segResp.data.byteLength : 0}`);
+
+        // Este es el test que realmente importa para el modo liviano: el
+        // reproductor del cliente pide el segmento DIRECTO al CDN, sin
+        // ningún header nuestro. Si esto da distinto de 200, el modo
+        // liviano (USE_PROXY sin setear) va a fallar para este proveedor
+        // puntual, aunque el proxy completo (USE_PROXY=1) funcione bien.
+        const segRespNoHeaders = await axios.get(segLine, { timeout: 12000, responseType: 'arraybuffer', validateStatus: () => true });
+        p(`SEGMENTO SIN headers -> status ${segRespNoHeaders.status}, bytes: ${segRespNoHeaders.data ? segRespNoHeaders.data.byteLength : 0}`);
+
+        if (segRespNoHeaders.status === 200) {
+            p('\n✅ Este proveedor NO exige headers en los segmentos -> el modo liviano (directo) debería funcionar bien acá.');
+        } else {
+            p('\n❌ Este proveedor SÍ exige headers en los segmentos -> el modo liviano va a fallar acá, hace falta USE_PROXY=1 (o proxear segmentos solo para este proveedor).');
+        }
+
         res.send(log.join('\n'));
     } catch (e) {
         p('EXCEPCIÓN: ' + e.message);
