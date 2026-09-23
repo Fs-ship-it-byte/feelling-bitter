@@ -15,13 +15,6 @@ function buildVidUrl(imdbId, season, episode) {
     return `${BASE}/vidurl/${imdbId}/`;
 }
 
-// ==========================================
-// 1) DESCIFRADO: Proof-of-Work + AES-CBC
-// ==========================================
-// El PoW (SHA-256 con dificultad N ceros al inicio) y el descifrado AES son
-// operaciones estándar -- no hace falta un navegador real, se resuelven acá
-// mismo en el servidor, mucho más rápido que con Puppeteer.
-
 function solvePow(challenge, difficulty) {
     const prefix = '0'.repeat(difficulty);
     let nonce = 0;
@@ -85,10 +78,6 @@ async function getDecryptedEmbeds(imdbId, season, episode) {
     }
     return results;
 }
-
-// ==========================================
-// 2) RESOLUCIÓN POR SERVIDOR (VidHide, VOE, StreamWish)
-// ==========================================
 
 function unpackEvalPacker(script) {
     const match = script.match(/eval\(function\(p,a,c,k,e,[rd]\)\{.*?\}\s*\('([\s\S]*?)',\s*(\d+),\s*(\d+),\s*'([\s\S]*?)'\.split\('\|'\)/);
@@ -191,7 +180,6 @@ async function resolveVoe(url) {
         let encText = Array.isArray(parsed) ? parsed[0] : parsed;
         if (typeof encText !== 'string') return null;
 
-        // ROT13
         let decoded = encText.replace(/[a-zA-Z]/g, (c) => {
             const code = c.charCodeAt(0);
             const limit = c <= 'Z' ? 90 : 122;
@@ -221,17 +209,6 @@ async function resolveVoe(url) {
     }
 }
 
-// ==========================================
-// 2c) RESPALDO CON NAVEGADOR (Puppeteer)
-// ==========================================
-// StreamWish tiene protección anti-devtools (un debugger; en loop que pausa
-// la ejecución si hay un debugger real conectado) y a veces necesita JS real
-// para revelar el m3u8. VOE, además, pide resolver un captcha Altcha (un
-// checkbox que dispara una prueba de trabajo del lado del cliente) antes de
-// arrancar el reproductor. axios no ejecuta JS, así que ninguno de los dos
-// casos se puede resolver sin un navegador real -- lo usamos SOLO como
-// respaldo, cuando el método rápido (sin navegador) no encuentra nada.
-
 let puppeteer = null;
 try { puppeteer = require('puppeteer'); } catch (e) { /* opcional */ }
 
@@ -241,6 +218,7 @@ async function getBrowser() {
     if (_browserInstance && _browserInstance.isConnected()) return _browserInstance;
     const launchOpts = {
         headless: 'new',
+        protocolTimeout: 30000, // antes sin setear -> podía colgarse minutos enteros
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
     };
     if (process.env.PUPPETEER_EXECUTABLE_PATH) launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -248,7 +226,22 @@ async function getBrowser() {
     return _browserInstance;
 }
 
+// Límite de concurrencia: con poca RAM, dos resoluciones abriendo pestañas al
+// mismo tiempo en el mismo Chromium compartido pueden saturarlo y producir
+// "Target.createTarget timed out". Con esto, las resoluciones vía Puppeteer
+// esperan su turno en vez de pelear por recursos simultáneamente.
+let _puppeteerQueue = Promise.resolve();
+function withPuppeteerLock(fn) {
+    const run = _puppeteerQueue.then(fn, fn);
+    _puppeteerQueue = run.then(() => undefined, () => undefined);
+    return run;
+}
+
 async function resolveViaBrowser(embedUrl, timeoutMs) {
+    return withPuppeteerLock(() => _resolveViaBrowserInner(embedUrl, timeoutMs));
+}
+
+async function _resolveViaBrowserInner(embedUrl, timeoutMs) {
     timeoutMs = timeoutMs || 30000;
     if (!puppeteer) return null;
 
@@ -261,8 +254,6 @@ async function resolveViaBrowser(embedUrl, timeoutMs) {
         page.setDefaultTimeout(timeoutMs);
         page.setDefaultNavigationTimeout(timeoutMs);
 
-        // Diálogos JS (alert/confirm/prompt) sin atender bloquean cualquier
-        // click/evaluate posterior -- los cerramos apenas aparecen.
         page.on('dialog', async (dialog) => { try { await dialog.dismiss(); } catch (e) {} });
 
         let resolved = null;
@@ -350,10 +341,6 @@ async function resolveViaBrowser(embedUrl, timeoutMs) {
         const centerX = Math.floor(viewport.width / 2);
         const centerY = Math.floor(viewport.height / 2);
 
-        // Clic agresivo sobre la página y CADA iframe hijo, más el checkbox
-        // de Altcha (VOE) si está presente -- el widget resuelve su propia
-        // prueba de trabajo solo con que quede marcado, no hace falta
-        // resolverla nosotros.
         async function tryClickEverywhere() {
             try { await page.mouse.click(centerX, centerY); } catch (e) {}
             const selectors = [
@@ -361,7 +348,10 @@ async function resolveViaBrowser(embedUrl, timeoutMs) {
                 '#player', '.plyr__control--overlaid', '.vjs-play-control',
                 'input[type="checkbox"][id^="altcha-checkbox"]',
                 '.altcha-checkbox', '[class*="altcha"] input[type="checkbox"]',
-                '[id="start"]', 'img[src*="play"]', '[onclick*="play"]'
+                '[id="start"]', 'img[src*="play"]', '[onclick*="play"]',
+                // Botones de "saltar anuncio" (video-ads con countdown/skip)
+                '[class*="skip" i]', '[id*="skip" i]', '.videoAdUiSkipButton',
+                '.ytp-ad-skip-button', 'button[aria-label*="skip" i]'
             ];
             const frames = page.frames();
             for (const frame of frames) {
@@ -376,6 +366,14 @@ async function resolveViaBrowser(embedUrl, timeoutMs) {
                                 } catch (e) {}
                             }
                         }
+                        // Botones de "Skip" que solo tienen el texto, sin clase/id reconocible
+                        const candidates = document.querySelectorAll('button, div, span, a');
+                        for (const el of candidates) {
+                            const txt = (el.textContent || '').trim().toLowerCase();
+                            if (txt === 'skip' || txt === 'skip ad' || txt === 'saltar' || txt === 'saltar anuncio') {
+                                try { el.click(); } catch (e) {}
+                            }
+                        }
                         const video = document.querySelector('video');
                         if (video) { try { video.muted = true; video.play().catch(() => {}); } catch (e) {} }
                     }, selectors);
@@ -383,11 +381,22 @@ async function resolveViaBrowser(embedUrl, timeoutMs) {
             }
         }
 
+        // Reintentamos el click unas pocas veces, bien espaciado (cada 3s,
+        // hasta 5 intentos) -- ni el loop agresivo original (cada 1.5s sobre
+        // todos los frames, que consumía de más) ni un solo intento (que
+        // resultó insuficiente para el checkbox de Altcha de VOE, que a
+        // veces tarda en aparecer o necesita un segundo intento).
+        await tryClickEverywhere();
+        let clickAttempts = 1;
+        const maxClickAttempts = 5;
+        const clickIntervalMs = 3000;
+
         const start = Date.now();
-        let lastClickAt = 0;
+        let lastClickAt = start;
         while (!resolved && Date.now() - start < timeoutMs) {
-            if (Date.now() - lastClickAt > 1500) {
+            if (clickAttempts < maxClickAttempts && Date.now() - lastClickAt > clickIntervalMs) {
                 lastClickAt = Date.now();
+                clickAttempts++;
                 await tryClickEverywhere();
             }
             await new Promise((r) => setTimeout(r, 300));
@@ -396,6 +405,11 @@ async function resolveViaBrowser(embedUrl, timeoutMs) {
         return resolved;
     } catch (e) {
         console.log('[Puppeteer] Error:', e.message);
+        if (/timed out|Target closed|Connection closed|Protocol error/i.test(e.message || '')) {
+            console.warn('[Puppeteer] Browser compartido parece roto, se descarta para relanzar uno limpio:', e.message);
+            try { if (_browserInstance) await _browserInstance.close(); } catch (_e) {}
+            _browserInstance = null;
+        }
         return null;
     } finally {
         if (browser && onTargetCreated) { try { browser.off('targetcreated', onTargetCreated); } catch (e) {} }
@@ -403,39 +417,54 @@ async function resolveViaBrowser(embedUrl, timeoutMs) {
     }
 }
 
+// Formas de URL "buenas" conocidas, una por servidor, sacadas de casos que
+// funcionaron perfecto. Si el link resuelto no calza con ninguna de estas
+// formas (o con algo muy similar), lo descartamos al toque -- sin gastar
+// tiempo/créditos validándolo contra el CDN real. Esto reemplaza la
+// validación por red que hacíamos antes.
+const GOOD_URL_PATTERNS = [
+    // VidHide: https://XXXX.acek-cdn.com/hls2/01/NNNNN/ID_n/master.m3u8?t=...&s=...&e=...&f=...&srv=...&asn=...
+    /^https?:\/\/[^/]*\.acek-cdn\.com\/.*master\.m3u8\?t=.*&s=.*&e=/i,
+    // StreamWish (variante .txt): https://XXXX.dominio/.../hls3/01/NNNNN/ID_,l,n,h,.urlset/master.txt
+    /\.urlset\/master\.(txt|m3u8)(\?|$)/i,
+    // VOE: https://ugc-cdn-caching-XXXX.cloudwindow-route.com/engine/hls2.../master.m3u8?t=...&s=...
+    /^https?:\/\/ugc-cdn-caching-[^.]+\.cloudwindow-route\.com\/.*master\.m3u8\?t=.*&s=/i
+];
+
+function isKnownGoodUrl(u) {
+    if (!u) return false;
+    return GOOD_URL_PATTERNS.some((rx) => rx.test(u));
+}
+
 async function resolveByServer(servername, embedUrl) {
     const name = (servername || '').toLowerCase();
 
-    if (name === 'vidhide') return resolveVidHide(embedUrl);
+    if (name === 'vidhide') {
+        const quick = await resolveVidHide(embedUrl);
+        if (quick && isKnownGoodUrl(quick.url)) return quick;
+        if (quick) console.log(`[VidHide] Resultado rápido no calza con el patrón esperado, descartado: ${quick.url}`);
+        return resolveViaBrowser(embedUrl);
+    }
 
     if (name === 'streamwish') {
         const quick = await resolveStreamWish(embedUrl);
-        if (quick) return quick;
-        console.log('[StreamWish] Método rápido no encontró nada, probando con navegador...');
+        if (quick && isKnownGoodUrl(quick.url)) return quick;
+        if (quick) console.log(`[StreamWish] Resultado rápido no calza con el patrón esperado, descartado: ${quick.url}`);
+        else console.log('[StreamWish] Método rápido no encontró nada, probando con navegador...');
         return resolveViaBrowser(embedUrl);
     }
 
     if (name === 'voe') {
-        const quick = await resolveVoe(embedUrl);
-        if (quick) return quick;
-        console.log('[VOE] Método rápido no encontró nada, probando con navegador (Altcha)...');
-        return resolveViaBrowser(embedUrl);
+        // VOE deshabilitado: el checkbox de Altcha nunca terminaba de
+        // resolverse, así que todos los pedidos quemaban el timeout
+        // completo de Puppeteer (~30s) en vano -- la fuente principal del
+        // consumo excesivo. Con vidhide y streamwish alcanza.
+        return null;
     }
 
     console.log(`[Resolvers] Servidor sin resolver implementado: ${servername}`);
     return null;
 }
-
-// ==========================================
-// 2b) PROXY DE HLS (m3u8 + segmentos)
-// ==========================================
-// Por qué existe esto: los master.m3u8 de estos CDN (acek-cdn.com y
-// similares) llevan un token atado a la IP/headers que lo negoció. Si le
-// entregamos esa URL cruda al reproductor (VLC, Stremio en el celular/TV),
-// la petición sale desde OTRA IP y el CDN la rechaza aunque los headers
-// estén bien puestos. Solución: nuestro propio servidor reproxea TODO
-// (m3u8 y cada segmento), siempre con la misma IP/headers, y el reproductor
-// solo habla con nosotros.
 
 function encodeProxyToken(url, headers) {
     return Buffer.from(JSON.stringify({ url, headers: headers || {} }), 'utf8').toString('base64url');
@@ -454,8 +483,6 @@ function makeAbsoluteUrl(url, base) {
     return base + '/' + url;
 }
 
-// Hosts típicos de redes de publicidad que a veces se "empalman" como si
-// fueran segmentos de video reales dentro del m3u8.
 const AD_HOST_PATTERNS = [/tiktokcdn\.com$/i, /doubleclick\.net$/i, /googlesyndication\.com$/i, /^ads?\./i];
 function looksLikeAdUrl(u) {
     try {
@@ -464,11 +491,15 @@ function looksLikeAdUrl(u) {
     } catch (e) { return false; }
 }
 
-// No decidimos "sub-playlist vs segmento" por la extensión del archivo
-// (algunos sitios nombran sus sub-playlists con ".txt"), sino por la
-// etiqueta que las precede en el propio m3u8: #EXT-X-STREAM-INF siempre
-// indica que la línea siguiente es una sub-playlist.
 function isM3u8Url(u) { return /\.m3u8(\?|#|$)/i.test(u); }
+
+// USE_PROXY=1 -> proxy completo (segmentos también pasan por nuestro server,
+//   máxima compatibilidad, máximo gasto de banda). Red de contención.
+// USE_PROXY sin setear (default) -> proxy "liviano": el manifest pasa por
+//   nuestro server con headers correctos (soluciona el bug de Android que no
+//   aplicaba bien proxyHeaders), pero los segmentos .ts van DIRECTO al CDN,
+//   sin gastar banda nuestra.
+const USE_PROXY = process.env.USE_PROXY === '1';
 
 function rewriteM3u8(playlistText, baseUrl, headers) {
     const lines = playlistText.split(/\r?\n/);
@@ -489,6 +520,8 @@ function rewriteM3u8(playlistText, baseUrl, headers) {
                 }));
                 continue;
             }
+            // #EXT-X-KEY/#EXT-X-MAP: pesan casi nada, siguen por el proxy de
+            // segmento siempre (barato, y evita arriesgar una clave de cifrado).
             out.push(line.replace(/URI="([^"]+)"/i, (m, uri) => {
                 const abs = makeAbsoluteUrl(uri, baseUrl.replace(/\/[^/]*$/, ''));
                 const token = encodeProxyToken(abs, headers);
@@ -507,10 +540,20 @@ function rewriteM3u8(playlistText, baseUrl, headers) {
             continue;
         }
 
-        const token = encodeProxyToken(absUrl, headers);
-        out.push(isPlaylist
-            ? `${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`
-            : `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`);
+        if (isPlaylist) {
+            const token = encodeProxyToken(absUrl, headers);
+            out.push(`${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`);
+            continue;
+        }
+
+        // Segmento real (no ad, no sub-playlist): directo al CDN por default,
+        // o por nuestro proxy si USE_PROXY=1.
+        if (USE_PROXY) {
+            const token = encodeProxyToken(absUrl, headers);
+            out.push(`${PUBLIC_URL}/hlsproxy/segment/${token}/seg`);
+        } else {
+            out.push(absUrl);
+        }
     }
     return out.join('\n');
 }
@@ -524,6 +567,21 @@ async function handleHlsPlaylistProxy(req, res) {
             transformResponse: [(d) => d]
         });
         const rewritten = rewriteM3u8(upstream.data, data.url, data.headers);
+
+        // Si el filtro de publicidad dejó la playlist sin NINGÚN segmento
+        // real (todo era ads, como pasa con ciertos embeds "hijackeados"),
+        // no tiene sentido devolver un 200 vacío -- el reproductor se queda
+        // colgado esperando datos que nunca van a llegar. Mejor fallar
+        // rápido y explícito.
+        const hasRealSegment = rewritten.split(/\r?\n/).some((l) => {
+            const t = l.trim();
+            return t && !t.startsWith('#');
+        });
+        if (!hasRealSegment) {
+            console.log(`[HLS-PROXY] Sub-playlist sin segmentos reales tras filtrar ads: ${data.url}`);
+            return res.status(502).send('Este embed no tiene video real -- toda la sub-playlist era publicidad.');
+        }
+
         res.set('Access-Control-Allow-Origin', '*');
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewritten);
@@ -555,10 +613,6 @@ function buildProxyPlaylistUrl(targetUrl, headers) {
 app.get('/hlsproxy/playlist/:token/*', handleHlsPlaylistProxy);
 app.get('/hlsproxy/segment/:token/*', handleHlsSegmentProxy);
 
-// ==========================================
-// 3) ENDPOINT DE STREAMING
-// ==========================================
-
 app.get('/manifest.json', (req, res) => {
     res.json({
         id: 'com.pelispedia.standalone',
@@ -572,39 +626,66 @@ app.get('/manifest.json', (req, res) => {
     });
 });
 
+// Stremio suele reintentar automáticamente si un pedido de stream tarda
+// mucho en responder -- eso dispara TODO el pipeline de nuevo (incluyendo
+// otro navegador Puppeteer), duplicando el trabajo y compitiendo por los
+// mismos recursos, lo cual paradójicamente hace que todo tarde AÚN MÁS. Para
+// cortar eso: si llega un pedido idéntico (mismo type+id) mientras ya hay
+// uno igual en curso, esperamos el MISMO resultado en vez de arrancar todo
+// de nuevo desde cero.
+const inFlightRequests = new Map();
+
 app.get('/stream/:type/:idWithExt', async (req, res) => {
-    const t0 = Date.now();
+    const id = req.params.idWithExt.replace(/\.json$/, '');
+    const requestKey = `${req.params.type}:${id}`;
+
+    if (inFlightRequests.has(requestKey)) {
+        console.log(`Pedido duplicado detectado para ${requestKey} -- reusando la resolución en curso en vez de arrancar otra.`);
+        try {
+            const streams = await inFlightRequests.get(requestKey);
+            return res.json({ streams });
+        } catch (e) {
+            return res.json({ streams: [] });
+        }
+    }
+
+    const resultPromise = resolveStreamsFor(req.params.type, id);
+    inFlightRequests.set(requestKey, resultPromise);
     try {
-        const id = req.params.idWithExt.replace(/\.json$/, '');
-        const [imdbId, season, episode] = id.split(':');
-        console.log(`--- Pedido: ${req.params.type} ${id} ---`);
-
-        const embeds = await getDecryptedEmbeds(imdbId, season, episode);
-        console.log(`[${Date.now() - t0}ms] Embeds descifrados: ${embeds.length} (${embeds.map(e => e.servername).join(', ')})`);
-
-        const resolved = await Promise.all(embeds.map(async (e) => {
-            const r = await resolveByServer(e.servername, e.embedUrl);
-            if (!r) return null;
-            // No le pasamos la URL cruda del CDN al reproductor -- el token
-            // del m3u8 queda atado a la IP/headers con los que nuestro
-            // servidor lo negoció. Todo pasa por nuestro propio proxy.
-            return {
-                name: `PelisPedia - ${e.servername}`,
-                title: `${e.language} - ${e.servername}`,
-                url: buildProxyPlaylistUrl(r.url, r.headers)
-            };
-        }));
-
-        const streams = resolved.filter(Boolean);
-        console.log(`[${Date.now() - t0}ms] Streams resueltos: ${streams.length} (tiempo total de esta respuesta)`);
+        const streams = await resultPromise;
         res.json({ streams });
     } catch (e) {
         console.log('Error en /stream:', e.message);
         res.json({ streams: [] });
+    } finally {
+        inFlightRequests.delete(requestKey);
     }
 });
 
-// --- DIAGNÓSTICO: confirmar que Puppeteer/Chromium arranca bien en este contenedor ---
+async function resolveStreamsFor(type, id) {
+    const t0 = Date.now();
+    const [imdbId, season, episode] = id.split(':');
+    console.log(`--- Pedido: ${type} ${id} ---`);
+
+    const embeds = await getDecryptedEmbeds(imdbId, season, episode);
+    console.log(`[${Date.now() - t0}ms] Embeds descifrados: ${embeds.length} (${embeds.map(e => e.servername).join(', ')})`);
+
+    const resolved = await Promise.all(embeds.map(async (e) => {
+        const r = await resolveByServer(e.servername, e.embedUrl);
+        if (!r) return null;
+        console.log(`👉 [${e.servername}] Enlace a pasar al proxy: ${r.url} | Referer=${r.headers.Referer} Origin=${r.headers.Origin}`);
+        return {
+            name: `PelisPedia - ${e.servername}`,
+            title: `${e.language} - ${e.servername}`,
+            url: buildProxyPlaylistUrl(r.url, r.headers)
+        };
+    }));
+
+    const streams = resolved.filter(Boolean);
+    console.log(`[${Date.now() - t0}ms] Streams resueltos: ${streams.length} (tiempo total de esta respuesta)`);
+    return streams;
+}
+
 app.get('/debug/browsercheck', async (req, res) => {
     res.set('Content-Type', 'text/plain');
     if (!puppeteer) return res.status(500).send('El paquete "puppeteer" no está instalado (require falló al arrancar el server).');
@@ -621,7 +702,6 @@ app.get('/debug/browsercheck', async (req, res) => {
     }
 });
 
-// --- DIAGNÓSTICO: probar un resolver puntual con logging detallado ---
 app.get('/debug/resolve', async (req, res) => {
     const { server, url, force } = req.query;
     if (!server || !url) return res.status(400).send('Uso: /debug/resolve?server=streamwish&url=<embed>&force=browser (force es opcional)');
@@ -643,7 +723,6 @@ app.get('/debug/resolve', async (req, res) => {
     res.send(log.join('\n'));
 });
 
-// --- DIAGNÓSTICO: ver los embeds descifrados sin resolverlos ---
 app.get('/debug/embeds', async (req, res) => {
     const { imdb, season, episode } = req.query;
     if (!imdb) return res.status(400).send('Falta ?imdb=ttXXXXXXX');
@@ -656,8 +735,6 @@ app.get('/debug/embeds', async (req, res) => {
     }
 });
 
-// --- DIAGNÓSTICO: seguir la cadena completa master -> sub-playlist -> segmento ---
-// --- DIAGNÓSTICO: fetch crudo, SIN pasar por nuestro proxy/filtro ---
 app.get('/debug/rawfetch', async (req, res) => {
     const proxyUrl = req.query.url;
     if (!proxyUrl) return res.status(400).send('Falta ?url=<link completo de /hlsproxy/playlist/.../algo.m3u8>');
@@ -683,19 +760,60 @@ app.get('/debug/rawfetch', async (req, res) => {
     }
 });
 
+app.get('/debug/adcheck', async (req, res) => {
+    const masterUrl = req.query.url;
+    if (!masterUrl) return res.status(400).send('Falta ?url= (opcional: &referer=&origin=)');
+    res.set('Content-Type', 'text/plain');
+    const extraHeaders = { 'User-Agent': PS_UA };
+    if (req.query.referer) extraHeaders.Referer = req.query.referer;
+    if (req.query.origin) extraHeaders.Origin = req.query.origin;
+    try {
+        const masterResp = await axios.get(masterUrl, { headers: extraHeaders, timeout: 12000, responseType: 'text', transformResponse: [(d) => d] });
+        const subLineRaw = String(masterResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
+        const subLine = makeAbsoluteUrl(subLineRaw.trim(), masterUrl.replace(/\/[^/]*$/, ''));
+        const subResp = await axios.get(subLine, { headers: extraHeaders, timeout: 12000, responseType: 'text', transformResponse: [(d) => d] });
+        const lines = String(subResp.data).split(/\r?\n/);
+        let total = 0, ads = 0;
+        const sampleReal = [];
+        const sampleAds = [];
+        for (const line of lines) {
+            const t = line.trim();
+            if (!t || t.startsWith('#')) continue;
+            const abs = /^https?:\/\//i.test(t) ? t : makeAbsoluteUrl(t, subLine.replace(/\/[^/]*$/, ''));
+            total++;
+            if (looksLikeAdUrl(abs)) { ads++; if (sampleAds.length < 3) sampleAds.push(abs); }
+            else { if (sampleReal.length < 3) sampleReal.push(abs); }
+        }
+        res.send(
+            `Total de líneas de segmento en la sub-playlist: ${total}\n` +
+            `Detectadas como publicidad (se filtrarían): ${ads}\n` +
+            `Quedarían como reales tras el filtro: ${total - ads}\n\n` +
+            `Ejemplos de "real": ${JSON.stringify(sampleReal, null, 2)}\n\n` +
+            `Ejemplos de "ad" filtrado: ${JSON.stringify(sampleAds, null, 2)}`
+        );
+    } catch (e) {
+        res.status(500).send('Error: ' + e.message);
+    }
+});
+
 app.get('/debug/fullchain', async (req, res) => {
     const masterUrl = req.query.url;
-    if (!masterUrl) return res.status(400).send('Falta ?url=');
+    if (!masterUrl) return res.status(400).send('Falta ?url= (opcional: &referer=&origin=)');
     res.set('Content-Type', 'text/plain');
     const log = [];
     const t0 = Date.now();
     const p = (msg) => log.push(`[${Date.now() - t0}ms] ${msg}`);
 
+    const extraHeaders = { 'User-Agent': PS_UA };
+    if (req.query.referer) extraHeaders.Referer = req.query.referer;
+    if (req.query.origin) extraHeaders.Origin = req.query.origin;
+    p(`Headers usados: ${JSON.stringify(extraHeaders)}`);
+
     async function fetchText(u) {
-        return axios.get(u, { timeout: 12000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true });
+        return axios.get(u, { timeout: 12000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true, headers: extraHeaders });
     }
     async function fetchBinary(u) {
-        return axios.get(u, { timeout: 12000, responseType: 'arraybuffer', validateStatus: () => true });
+        return axios.get(u, { timeout: 12000, responseType: 'arraybuffer', validateStatus: () => true, headers: extraHeaders });
     }
 
     try {
@@ -703,20 +821,22 @@ app.get('/debug/fullchain', async (req, res) => {
         p(`MASTER status ${masterResp.status}, largo ${String(masterResp.data).length}`);
         if (masterResp.status !== 200) return res.send(log.join('\n') + '\n\nBody:\n' + String(masterResp.data).slice(0, 500));
 
-        const subLine = String(masterResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
-        if (!subLine) return res.send(log.join('\n') + '\n\nEl master no tiene sub-playlist.');
-        p(`Sub-playlist: ${subLine.trim()}`);
+        const subLineRaw = String(masterResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
+        if (!subLineRaw) return res.send(log.join('\n') + '\n\nEl master no tiene sub-playlist.');
+        const subLine = makeAbsoluteUrl(subLineRaw.trim(), masterUrl.replace(/\/[^/]*$/, ''));
+        p(`Sub-playlist: ${subLine}`);
 
-        const subResp = await fetchText(subLine.trim());
+        const subResp = await fetchText(subLine);
         p(`SUB-PLAYLIST status ${subResp.status}, largo ${String(subResp.data).length}`);
         if (subResp.status !== 200) return res.send(log.join('\n') + '\n\nBody:\n' + String(subResp.data).slice(0, 500));
         p('Primeros 300 chars de la sub-playlist:\n' + String(subResp.data).slice(0, 300));
 
-        const segLine = String(subResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
-        if (!segLine) return res.send(log.join('\n') + '\n\nSin segmentos.');
-        p(`Primer segmento: ${segLine.trim()}`);
+        const segLineRaw = String(subResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
+        if (!segLineRaw) return res.send(log.join('\n') + '\n\nSin segmentos.');
+        const segLine = makeAbsoluteUrl(segLineRaw.trim(), subLine.replace(/\/[^/]*$/, ''));
+        p(`Primer segmento: ${segLine}`);
 
-        const segResp = await fetchBinary(segLine.trim());
+        const segResp = await fetchBinary(segLine);
         p(`SEGMENTO status ${segResp.status}, bytes: ${segResp.data ? segResp.data.byteLength : 0}`);
         res.send(log.join('\n'));
     } catch (e) {
