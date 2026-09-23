@@ -507,18 +507,15 @@ async function validateHlsCandidate(candidateUrl, headers, depth) {
         return validateHlsCandidate(bestUrl, headers, depth + 1);
     }
 
+    // Solo validamos que sea un m3u8 real con al menos un segmento -- NO
+    // rechazamos por "segmentos sospechosos" acá. Esa lógica resultó
+    // demasiado frágil: un pre-roll de ads mezclado (normal en varios
+    // sitios) podía coincidir con los primeros N segmentos muestreados y
+    // tirar abajo una fuente 100% real y buena. El filtrado de segmentos de
+    // publicidad ya lo hace rewriteM3u8 al momento de SERVIR el manifest
+    // (ver looksLikeAdUrl) -- ese es el lugar correcto para eso, no acá.
     const segLines = lines.filter((l) => !l.startsWith('#'));
     if (segLines.length === 0) return null;
-    const sample = segLines.slice(0, 10);
-    let suspiciousCount = 0;
-    for (const segLine of sample) {
-        const segUrl = new URL(segLine, candidateUrl).href;
-        if (isSuspiciousSegmentUrl(segUrl)) suspiciousCount++;
-    }
-    if (suspiciousCount === sample.length) {
-        console.warn('[validate] candidato rechazado, TODOS los segmentos muestreados son sospechosos:', candidateUrl);
-        return null;
-    }
     return candidateUrl;
 }
 
