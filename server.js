@@ -218,7 +218,6 @@ async function getBrowser() {
     if (_browserInstance && _browserInstance.isConnected()) return _browserInstance;
     const launchOpts = {
         headless: 'new',
-        protocolTimeout: 30000, // antes sin setear -> podía colgarse minutos enteros
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
     };
     if (process.env.PUPPETEER_EXECUTABLE_PATH) launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -226,22 +225,7 @@ async function getBrowser() {
     return _browserInstance;
 }
 
-// Límite de concurrencia: con poca RAM, dos resoluciones abriendo pestañas al
-// mismo tiempo en el mismo Chromium compartido pueden saturarlo y producir
-// "Target.createTarget timed out". Con esto, las resoluciones vía Puppeteer
-// esperan su turno en vez de pelear por recursos simultáneamente.
-let _puppeteerQueue = Promise.resolve();
-function withPuppeteerLock(fn) {
-    const run = _puppeteerQueue.then(fn, fn);
-    _puppeteerQueue = run.then(() => undefined, () => undefined);
-    return run;
-}
-
 async function resolveViaBrowser(embedUrl, timeoutMs) {
-    return withPuppeteerLock(() => _resolveViaBrowserInner(embedUrl, timeoutMs));
-}
-
-async function _resolveViaBrowserInner(embedUrl, timeoutMs) {
     timeoutMs = timeoutMs || 30000;
     if (!puppeteer) return null;
 
@@ -279,27 +263,9 @@ async function _resolveViaBrowserInner(embedUrl, timeoutMs) {
         page.on('request', (req) => {
             const url = req.url();
             const type = req.resourceType();
-
-            // Antes: substrings libres sobre la URL entera (ej: 'pop.',
-            // 'tracker') podían matchear por accidente el propio CDN de
-            // video real (un subdominio tipo "cdn-pop3.xxx.com", o un
-            // parámetro de query con esas letras) y abortar el request que
-            // buscábamos. Ahora chequeamos con límites de palabra sobre el
-            // hostname (para lo que es claramente un dominio de
-            // publicidad/tracking) y patrones de PATH específicos por
-            // separado (para rutas de ads dentro de un host que puede ser
-            // legítimo).
-            let host = '';
-            try { host = new URL(url).hostname.toLowerCase(); } catch (e) {}
-            const pathAndQuery = url.toLowerCase().replace(/^https?:\/\/[^/]+/, '');
-
-            const AD_HOST_WORDS = /(^|\.)(ads?|adservice|adsystem|doubleclick|popads|popcash|analytics|tracker|trk)\./i;
-            const AD_PATH_PATTERNS = /\/ads\/|[?&](vast|vpaid)[=&]|\/vast[/?]|\/vpaid[/?]/i;
-
-            if (AD_HOST_WORDS.test(host) || AD_PATH_PATTERNS.test(pathAndQuery)) {
-                req.abort();
-                return;
-            }
+            const urlLower = url.toLowerCase();
+            const AD_KEYWORDS = ['/ads/', 'vast', 'vpaid', 'popads', 'popcash', 'pop.', 'tracker', 'analytics', 'doubleclick', 'adservice', 'adsystem'];
+            if (AD_KEYWORDS.some((kw) => urlLower.includes(kw))) { req.abort(); return; }
             if (type === 'image' || type === 'font') { req.abort(); return; }
             if (!resolved && type !== 'document' && (/\.m3u8(\?|$)/i.test(url) || /master\.json(\?|$)/i.test(url))) {
                 resolved = {
@@ -423,11 +389,6 @@ async function _resolveViaBrowserInner(embedUrl, timeoutMs) {
         return resolved;
     } catch (e) {
         console.log('[Puppeteer] Error:', e.message);
-        if (/timed out|Target closed|Connection closed|Protocol error/i.test(e.message || '')) {
-            console.warn('[Puppeteer] Browser compartido parece roto, se descarta para relanzar uno limpio:', e.message);
-            try { if (_browserInstance) await _browserInstance.close(); } catch (_e) {}
-            _browserInstance = null;
-        }
         return null;
     } finally {
         if (browser && onTargetCreated) { try { browser.off('targetcreated', onTargetCreated); } catch (e) {} }
@@ -435,119 +396,21 @@ async function _resolveViaBrowserInner(embedUrl, timeoutMs) {
     }
 }
 
-// Formas de URL "buenas" conocidas, una por servidor, sacadas de casos que
-// funcionaron perfecto. Si el link resuelto no calza con ninguna de estas
-// formas (o con algo muy similar), lo descartamos al toque -- sin gastar
-// tiempo/créditos validándolo contra el CDN real. Esto reemplaza la
-// validación por red que hacíamos antes.
-const GOOD_URL_PATTERNS = [
-    // VidHide: https://XXXX.acek-cdn.com/hls2/01/NNNNN/ID_n/master.m3u8?t=...&s=...&e=...&f=...&srv=...&asn=...
-    /^https?:\/\/[^/]*\.acek-cdn\.com\/.*master\.m3u8\?t=.*&s=.*&e=/i,
-    // StreamWish (variante .txt): https://XXXX.dominio/.../hls3/01/NNNNN/ID_,l,n,h,.urlset/master.txt
-    /\.urlset\/master\.(txt|m3u8)(\?|$)/i,
-    // VOE: https://ugc-cdn-caching-XXXX.cloudwindow-route.com/engine/hls2.../master.m3u8?t=...&s=...
-    /^https?:\/\/ugc-cdn-caching-[^.]+\.cloudwindow-route\.com\/.*master\.m3u8\?t=.*&s=/i
-];
-
-// ==========================================
-// VALIDACIÓN DE CANDIDATOS (por red, no por forma de URL)
-// ==========================================
-// Antes esto usaba un allowlist de regex de "formas de URL conocidas" -- el
-// problema es que cada CDN/dominio nuevo de streamwish (niramirus.com,
-// hglamioz.com, medixiru.com, etc) tiene una forma de URL distinta, así que
-// el allowlist rechazaba links 100% válidos solo porque no habíamos visto
-// esa forma en particular antes. Reemplazado por validación real: bajamos el
-// candidato, confirmamos que es un .m3u8 real, seguimos a la mejor variante
-// si es un master, y solo rechazamos si TODOS los segmentos muestreados son
-// de una red de publicidad conocida (un pre-roll mezclado con contenido real
-// no invalida el resto del stream).
-function isSuspiciousSegmentUrl(u) {
-    try {
-        const parsed = new URL(u);
-        const host = parsed.hostname.toLowerCase();
-        const pathname = parsed.pathname.toLowerCase();
-        if (host === 'tiktokcdn.com' || host.endsWith('.tiktokcdn.com')) return true;
-        if (pathname.endsWith('.image') || pathname.includes('/ad-site-')) return true;
-        if (/\.(png|jpg|jpeg|webp|gif|svg|avif)$/i.test(pathname)) return true;
-        return false;
-    } catch (e) { return false; }
-}
-
-async function validateHlsCandidate(candidateUrl, headers, depth) {
-    depth = depth || 0;
-    if (depth > 3) return null;
-    if (isSuspiciousSegmentUrl(candidateUrl)) return null;
-
-    let text;
-    try {
-        const r = await axios.get(candidateUrl, {
-            headers, timeout: 10000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true
-        });
-        if (r.status !== 200) return null;
-        text = r.data;
-    } catch (e) { return null; }
-
-    if (typeof text !== 'string' || !text.trimStart().startsWith('#EXTM3U')) return null;
-    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-
-    if (text.includes('#EXT-X-STREAM-INF')) {
-        let bestUrl = null, bestScore = -1;
-        for (let i = 0; i < lines.length; i++) {
-            if (!lines[i].includes('#EXT-X-STREAM-INF')) continue;
-            const resM = /RESOLUTION=(\d+)x(\d+)/i.exec(lines[i]);
-            const score = resM ? Number(resM[1]) * Number(resM[2]) : 0;
-            for (let j = i + 1; j < lines.length; j++) {
-                if (lines[j].startsWith('#')) continue;
-                const variant = new URL(lines[j], candidateUrl).href;
-                if (score > bestScore) { bestScore = score; bestUrl = variant; }
-                break;
-            }
-        }
-        if (!bestUrl) return null;
-        return validateHlsCandidate(bestUrl, headers, depth + 1);
-    }
-
-    // Solo validamos que sea un m3u8 real con al menos un segmento -- NO
-    // rechazamos por "segmentos sospechosos" acá. Esa lógica resultó
-    // demasiado frágil: un pre-roll de ads mezclado (normal en varios
-    // sitios) podía coincidir con los primeros N segmentos muestreados y
-    // tirar abajo una fuente 100% real y buena. El filtrado de segmentos de
-    // publicidad ya lo hace rewriteM3u8 al momento de SERVIR el manifest
-    // (ver looksLikeAdUrl) -- ese es el lugar correcto para eso, no acá.
-    const segLines = lines.filter((l) => !l.startsWith('#'));
-    if (segLines.length === 0) return null;
-    return candidateUrl;
-}
-
-function isKnownGoodUrl(u) {
-    // Se mantiene como filtro rápido opcional (ver USE_STRICT_URL_PATTERNS),
-    // pero ya NO es el único criterio -- ver validateHlsCandidate arriba.
-    if (!u) return false;
-    return GOOD_URL_PATTERNS.some((rx) => rx.test(u));
-}
-
 async function resolveByServer(servername, embedUrl) {
     const name = (servername || '').toLowerCase();
 
     if (name === 'vidhide') {
         const quick = await resolveVidHide(embedUrl);
-        if (quick) {
-            const validated = await validateHlsCandidate(quick.url, quick.headers);
-            if (validated) return { url: validated, headers: quick.headers };
-            console.log(`[VidHide] Resultado rápido no pasó la validación real, descartado: ${quick.url}`);
-        }
+        if (quick && await validateHlsCandidate(quick.url, quick.headers)) return quick;
+        if (quick) console.log(`[VidHide] Resultado rápido no pasó la validación, descartado: ${quick.url}`);
         return resolveViaBrowser(embedUrl);
     }
 
     if (name === 'streamwish') {
         const quick = await resolveStreamWish(embedUrl);
-        if (quick) {
-            const validated = await validateHlsCandidate(quick.url, quick.headers);
-            if (validated) return { url: validated, headers: quick.headers };
-            console.log(`[StreamWish] Resultado rápido no pasó la validación real, descartado: ${quick.url}`);
-        } else {
-            console.log('[StreamWish] Método rápido no encontró nada, probando con navegador...');
-        }
+        if (quick && await validateHlsCandidate(quick.url, quick.headers)) return quick;
+        if (quick) console.log(`[StreamWish] Resultado rápido no pasó la validación, descartado: ${quick.url}`);
+        else console.log('[StreamWish] Método rápido no encontró nada, probando con navegador...');
         return resolveViaBrowser(embedUrl);
     }
 
@@ -580,78 +443,133 @@ function makeAbsoluteUrl(url, base) {
     return base + '/' + url;
 }
 
-const AD_HOST_PATTERNS = [/tiktokcdn\.com$/i, /doubleclick\.net$/i, /googlesyndication\.com$/i, /^ads?\./i];
-function looksLikeAdUrl(u) {
+// ==========================================
+// VALIDACIÓN DE CANDIDATOS (evita señuelos/publicidad) -- ported de bookish-tribble
+// ==========================================
+// A diferencia del enfoque anterior (borrar del m3u8 cualquier línea que
+// "pareciera" un ad por regex de hostname), que rompía el playlist entero
+// si el heurístico se equivocaba, acá SOLO se usa para decidir si un
+// candidato de URL es un señuelo completo (validándolo con una muestra de
+// sus segmentos) antes de aceptarlo como fuente final. Nunca se borran
+// líneas de un playlist ya aceptado -- eso descuadra las duraciones/orden
+// y puede tumbar el stream completo.
+function isSuspiciousSegmentUrl(u) {
     try {
-        const host = new URL(u).host;
-        return AD_HOST_PATTERNS.some(rx => rx.test(host)) || /ad-site|\/ads?\//i.test(u);
+        const parsed = new URL(u);
+        const host = parsed.hostname.toLowerCase();
+        const pathname = parsed.pathname.toLowerCase();
+        if (host === 'tiktokcdn.com' || host.endsWith('.tiktokcdn.com')) return true;
+        if (pathname.endsWith('.image') || pathname.indexOf('/ad-site-') !== -1) return true;
+        if (/\.(png|jpg|jpeg|webp|gif|svg|avif)$/i.test(pathname)) return true;
+        return false;
     } catch (e) { return false; }
+}
+
+async function validateHlsCandidate(candidateUrl, headers, depth) {
+    depth = depth || 0;
+    if (depth > 3) return null;
+    if (isSuspiciousSegmentUrl(candidateUrl)) return null;
+
+    let text;
+    try {
+        const r = await axios.get(candidateUrl, {
+            headers, timeout: 10000, responseType: 'text',
+            transformResponse: [(d) => d]
+        });
+        text = r.data;
+    } catch (e) { return null; }
+
+    if (typeof text !== 'string' || !text.trimStart().startsWith('#EXTM3U')) return null;
+    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+    if (text.indexOf('#EXT-X-STREAM-INF') !== -1) {
+        let bestUrl = null, bestScore = -1;
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].indexOf('#EXT-X-STREAM-INF') === -1) continue;
+            const resM = /RESOLUTION=(\d+)x(\d+)/i.exec(lines[i]);
+            const score = resM ? Number(resM[1]) * Number(resM[2]) : 0;
+            for (let j = i + 1; j < lines.length; j++) {
+                if (lines[j].startsWith('#')) continue;
+                const variant = new URL(lines[j], candidateUrl).href;
+                if (score > bestScore) { bestScore = score; bestUrl = variant; }
+                break;
+            }
+        }
+        if (!bestUrl) return null;
+        return validateHlsCandidate(bestUrl, headers, depth + 1);
+    }
+
+    const segLines = lines.filter((l) => !l.startsWith('#'));
+    if (segLines.length === 0) return null;
+    const sample = segLines.slice(0, 10);
+    let suspiciousCount = 0;
+    for (const seg of sample) {
+        const segUrl = new URL(seg, candidateUrl).href;
+        if (isSuspiciousSegmentUrl(segUrl)) suspiciousCount++;
+    }
+    if (suspiciousCount === sample.length) {
+        console.log('[HLS-VALIDATE] candidato rechazado, todos los segmentos de muestra son sospechosos (señuelo completo):', candidateUrl);
+        return null;
+    }
+    return candidateUrl;
 }
 
 function isM3u8Url(u) { return /\.m3u8(\?|#|$)/i.test(u); }
 
-// USE_PROXY=1 -> proxy completo (segmentos también pasan por nuestro server,
-//   máxima compatibilidad, máximo gasto de banda). Red de contención.
-// USE_PROXY sin setear (default) -> proxy "liviano": el manifest pasa por
-//   nuestro server con headers correctos (soluciona el bug de Android que no
-//   aplicaba bien proxyHeaders), pero los segmentos .ts van DIRECTO al CDN,
-//   sin gastar banda nuestra.
+// USE_PROXY=1 -> proxy completo (TODO pasa por nuestro server, incluidos
+//   los segmentos .ts -- máxima compatibilidad, máximo gasto de banda).
+// USE_PROXY sin setear (default) -> proxy liviano: el manifiesto (.m3u8,
+//   texto, KB) pasa por nuestro server con los headers correctos, pero los
+//   segmentos .ts (el video real, los GB) van directo al CDN sin gastar
+//   banda nuestra.
 const USE_PROXY = process.env.USE_PROXY === '1';
 
+// Reescribe el playlist SIN borrar segmentos -- si viene un pre-roll de
+// publicidad mezclado, el reproductor lo pasa de largo como con cualquier
+// stream con ads, en vez de que nosotros rompamos el playlist entero.
 function rewriteM3u8(playlistText, baseUrl, headers) {
     const lines = playlistText.split(/\r?\n/);
     let nextIsPlaylist = false;
-    const out = [];
 
-    for (const line of lines) {
+    const out = lines.map((line) => {
         const trimmed = line.trim();
-        if (!trimmed) { out.push(line); continue; }
+        if (!trimmed) return line;
 
         if (trimmed.startsWith('#')) {
             const upper = trimmed.toUpperCase();
+
             if (upper.startsWith('#EXT-X-I-FRAME-STREAM-INF')) {
-                out.push(line.replace(/URI="([^"]+)"/i, (m, uri) => {
+                return line.replace(/URI="([^"]+)"/i, (m, uri) => {
                     const abs = makeAbsoluteUrl(uri, baseUrl.replace(/\/[^/]*$/, ''));
                     const token = encodeProxyToken(abs, headers);
                     return `URI="${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8"`;
-                }));
-                continue;
+                });
             }
-            // #EXT-X-KEY/#EXT-X-MAP: pesan casi nada, siguen por el proxy de
-            // segmento siempre (barato, y evita arriesgar una clave de cifrado).
-            out.push(line.replace(/URI="([^"]+)"/i, (m, uri) => {
+
+            const rewritten = line.replace(/URI="([^"]+)"/i, (m, uri) => {
                 const abs = makeAbsoluteUrl(uri, baseUrl.replace(/\/[^/]*$/, ''));
                 const token = encodeProxyToken(abs, headers);
                 return `URI="${PUBLIC_URL}/hlsproxy/segment/${token}/seg"`;
-            }));
+            });
+
             nextIsPlaylist = upper.startsWith('#EXT-X-STREAM-INF');
-            continue;
+            return rewritten;
         }
 
         const absUrl = /^https?:\/\//i.test(trimmed) ? trimmed : makeAbsoluteUrl(trimmed, baseUrl.replace(/\/[^/]*$/, ''));
         const isPlaylist = nextIsPlaylist || isM3u8Url(absUrl);
         nextIsPlaylist = false;
 
-        if (!isPlaylist && looksLikeAdUrl(absUrl)) {
-            if (out.length > 0 && out[out.length - 1].trim().toUpperCase().startsWith('#EXTINF')) out.pop();
-            continue;
-        }
-
         if (isPlaylist) {
             const token = encodeProxyToken(absUrl, headers);
-            out.push(`${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`);
-            continue;
+            return `${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`;
         }
-
-        // Segmento real (no ad, no sub-playlist): directo al CDN por default,
-        // o por nuestro proxy si USE_PROXY=1.
         if (USE_PROXY) {
             const token = encodeProxyToken(absUrl, headers);
-            out.push(`${PUBLIC_URL}/hlsproxy/segment/${token}/seg`);
-        } else {
-            out.push(absUrl);
+            return `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`;
         }
-    }
+        return absUrl;
+    });
     return out.join('\n');
 }
 
@@ -664,21 +582,6 @@ async function handleHlsPlaylistProxy(req, res) {
             transformResponse: [(d) => d]
         });
         const rewritten = rewriteM3u8(upstream.data, data.url, data.headers);
-
-        // Si el filtro de publicidad dejó la playlist sin NINGÚN segmento
-        // real (todo era ads, como pasa con ciertos embeds "hijackeados"),
-        // no tiene sentido devolver un 200 vacío -- el reproductor se queda
-        // colgado esperando datos que nunca van a llegar. Mejor fallar
-        // rápido y explícito.
-        const hasRealSegment = rewritten.split(/\r?\n/).some((l) => {
-            const t = l.trim();
-            return t && !t.startsWith('#');
-        });
-        if (!hasRealSegment) {
-            console.log(`[HLS-PROXY] Sub-playlist sin segmentos reales tras filtrar ads: ${data.url}`);
-            return res.status(502).send('Este embed no tiene video real -- toda la sub-playlist era publicidad.');
-        }
-
         res.set('Access-Control-Allow-Origin', '*');
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewritten);
@@ -934,22 +837,7 @@ app.get('/debug/fullchain', async (req, res) => {
         p(`Primer segmento: ${segLine}`);
 
         const segResp = await fetchBinary(segLine);
-        p(`SEGMENTO CON headers -> status ${segResp.status}, bytes: ${segResp.data ? segResp.data.byteLength : 0}`);
-
-        // Este es el test que realmente importa para el modo liviano: el
-        // reproductor del cliente pide el segmento DIRECTO al CDN, sin
-        // ningún header nuestro. Si esto da distinto de 200, el modo
-        // liviano (USE_PROXY sin setear) va a fallar para este proveedor
-        // puntual, aunque el proxy completo (USE_PROXY=1) funcione bien.
-        const segRespNoHeaders = await axios.get(segLine, { timeout: 12000, responseType: 'arraybuffer', validateStatus: () => true });
-        p(`SEGMENTO SIN headers -> status ${segRespNoHeaders.status}, bytes: ${segRespNoHeaders.data ? segRespNoHeaders.data.byteLength : 0}`);
-
-        if (segRespNoHeaders.status === 200) {
-            p('\n✅ Este proveedor NO exige headers en los segmentos -> el modo liviano (directo) debería funcionar bien acá.');
-        } else {
-            p('\n❌ Este proveedor SÍ exige headers en los segmentos -> el modo liviano va a fallar acá, hace falta USE_PROXY=1 (o proxear segmentos solo para este proveedor).');
-        }
-
+        p(`SEGMENTO status ${segResp.status}, bytes: ${segResp.data ? segResp.data.byteLength : 0}`);
         res.send(log.join('\n'));
     } catch (e) {
         p('EXCEPCIÓN: ' + e.message);
