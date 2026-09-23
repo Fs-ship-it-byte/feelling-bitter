@@ -449,7 +449,82 @@ const GOOD_URL_PATTERNS = [
     /^https?:\/\/ugc-cdn-caching-[^.]+\.cloudwindow-route\.com\/.*master\.m3u8\?t=.*&s=/i
 ];
 
+// ==========================================
+// VALIDACIÓN DE CANDIDATOS (por red, no por forma de URL)
+// ==========================================
+// Antes esto usaba un allowlist de regex de "formas de URL conocidas" -- el
+// problema es que cada CDN/dominio nuevo de streamwish (niramirus.com,
+// hglamioz.com, medixiru.com, etc) tiene una forma de URL distinta, así que
+// el allowlist rechazaba links 100% válidos solo porque no habíamos visto
+// esa forma en particular antes. Reemplazado por validación real: bajamos el
+// candidato, confirmamos que es un .m3u8 real, seguimos a la mejor variante
+// si es un master, y solo rechazamos si TODOS los segmentos muestreados son
+// de una red de publicidad conocida (un pre-roll mezclado con contenido real
+// no invalida el resto del stream).
+function isSuspiciousSegmentUrl(u) {
+    try {
+        const parsed = new URL(u);
+        const host = parsed.hostname.toLowerCase();
+        const pathname = parsed.pathname.toLowerCase();
+        if (host === 'tiktokcdn.com' || host.endsWith('.tiktokcdn.com')) return true;
+        if (pathname.endsWith('.image') || pathname.includes('/ad-site-')) return true;
+        if (/\.(png|jpg|jpeg|webp|gif|svg|avif)$/i.test(pathname)) return true;
+        return false;
+    } catch (e) { return false; }
+}
+
+async function validateHlsCandidate(candidateUrl, headers, depth) {
+    depth = depth || 0;
+    if (depth > 3) return null;
+    if (isSuspiciousSegmentUrl(candidateUrl)) return null;
+
+    let text;
+    try {
+        const r = await axios.get(candidateUrl, {
+            headers, timeout: 10000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true
+        });
+        if (r.status !== 200) return null;
+        text = r.data;
+    } catch (e) { return null; }
+
+    if (typeof text !== 'string' || !text.trimStart().startsWith('#EXTM3U')) return null;
+    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+    if (text.includes('#EXT-X-STREAM-INF')) {
+        let bestUrl = null, bestScore = -1;
+        for (let i = 0; i < lines.length; i++) {
+            if (!lines[i].includes('#EXT-X-STREAM-INF')) continue;
+            const resM = /RESOLUTION=(\d+)x(\d+)/i.exec(lines[i]);
+            const score = resM ? Number(resM[1]) * Number(resM[2]) : 0;
+            for (let j = i + 1; j < lines.length; j++) {
+                if (lines[j].startsWith('#')) continue;
+                const variant = new URL(lines[j], candidateUrl).href;
+                if (score > bestScore) { bestScore = score; bestUrl = variant; }
+                break;
+            }
+        }
+        if (!bestUrl) return null;
+        return validateHlsCandidate(bestUrl, headers, depth + 1);
+    }
+
+    const segLines = lines.filter((l) => !l.startsWith('#'));
+    if (segLines.length === 0) return null;
+    const sample = segLines.slice(0, 10);
+    let suspiciousCount = 0;
+    for (const segLine of sample) {
+        const segUrl = new URL(segLine, candidateUrl).href;
+        if (isSuspiciousSegmentUrl(segUrl)) suspiciousCount++;
+    }
+    if (suspiciousCount === sample.length) {
+        console.warn('[validate] candidato rechazado, TODOS los segmentos muestreados son sospechosos:', candidateUrl);
+        return null;
+    }
+    return candidateUrl;
+}
+
 function isKnownGoodUrl(u) {
+    // Se mantiene como filtro rápido opcional (ver USE_STRICT_URL_PATTERNS),
+    // pero ya NO es el único criterio -- ver validateHlsCandidate arriba.
     if (!u) return false;
     return GOOD_URL_PATTERNS.some((rx) => rx.test(u));
 }
@@ -459,16 +534,23 @@ async function resolveByServer(servername, embedUrl) {
 
     if (name === 'vidhide') {
         const quick = await resolveVidHide(embedUrl);
-        if (quick && isKnownGoodUrl(quick.url)) return quick;
-        if (quick) console.log(`[VidHide] Resultado rápido no calza con el patrón esperado, descartado: ${quick.url}`);
+        if (quick) {
+            const validated = await validateHlsCandidate(quick.url, quick.headers);
+            if (validated) return { url: validated, headers: quick.headers };
+            console.log(`[VidHide] Resultado rápido no pasó la validación real, descartado: ${quick.url}`);
+        }
         return resolveViaBrowser(embedUrl);
     }
 
     if (name === 'streamwish') {
         const quick = await resolveStreamWish(embedUrl);
-        if (quick && isKnownGoodUrl(quick.url)) return quick;
-        if (quick) console.log(`[StreamWish] Resultado rápido no calza con el patrón esperado, descartado: ${quick.url}`);
-        else console.log('[StreamWish] Método rápido no encontró nada, probando con navegador...');
+        if (quick) {
+            const validated = await validateHlsCandidate(quick.url, quick.headers);
+            if (validated) return { url: validated, headers: quick.headers };
+            console.log(`[StreamWish] Resultado rápido no pasó la validación real, descartado: ${quick.url}`);
+        } else {
+            console.log('[StreamWish] Método rápido no encontró nada, probando con navegador...');
+        }
         return resolveViaBrowser(embedUrl);
     }
 
