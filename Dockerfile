@@ -3,7 +3,8 @@ FROM node:20-slim
 WORKDIR /app
 
 # Dependencias de sistema que Chromium necesita para correr en headless
-# dentro de un contenedor Linux mínimo.
+# dentro de un contenedor Linux mínimo (sin esto, Puppeteer crashea al
+# lanzar el browser con errores de librerías faltantes).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     fonts-liberation \
@@ -40,7 +41,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# Copiamos primero solo el manifest de deps para aprovechar la cache de
+# Docker en rebuilds cuando no cambió package.json.
 COPY package.json package-lock.json* ./
+
+# npm install de Puppeteer descarga Chromium solo (~200MB) automáticamente
+# en este paso -- no hace falta instalarlo aparte.
 RUN npm install --omit=dev
 
 COPY . .
