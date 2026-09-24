@@ -424,8 +424,10 @@ async function resolveByServer(servername, embedUrl) {
     return null;
 }
 
-function encodeProxyToken(url, headers) {
-    return Buffer.from(JSON.stringify({ url, headers: headers || {} }), 'utf8').toString('base64url');
+function encodeProxyToken(url, headers, full) {
+    const payload = { url, headers: headers || {} };
+    if (full) payload.full = true;   // solo cuando aplica: los tokens normales no cambian
+    return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
 function decodeProxyToken(token) {
     try { return JSON.parse(Buffer.from(token, 'base64url').toString('utf8')); }
@@ -507,7 +509,10 @@ const USE_PROXY = process.env.USE_PROXY === '1';
 // Reescribe el playlist SIN borrar segmentos -- si viene un pre-roll de
 // publicidad mezclado, el reproductor lo pasa de largo como con cualquier
 // stream con ads, en vez de que nosotros rompamos el playlist entero.
-function rewriteM3u8(playlistText, baseUrl, headers) {
+// `full` (viene en el token, ver buildProxyPlaylistUrl): proxy de segmentos SOLO
+// para esta cadena de playlists (las .txt de StreamWish), con los headers del
+// token y con nombre .ts para que el reproductor los acepte.
+function rewriteM3u8(playlistText, baseUrl, headers, full) {
     const lines = playlistText.split(/\r?\n/);
     let nextIsPlaylist = false;
 
@@ -521,7 +526,7 @@ function rewriteM3u8(playlistText, baseUrl, headers) {
             if (upper.startsWith('#EXT-X-I-FRAME-STREAM-INF')) {
                 return line.replace(/URI="([^"]+)"/i, (m, uri) => {
                     const abs = makeAbsoluteUrl(uri, baseUrl.replace(/\/[^/]*$/, ''));
-                    const token = encodeProxyToken(abs, headers);
+                    const token = encodeProxyToken(abs, headers, full);
                     return `URI="${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8"`;
                 });
             }
@@ -541,15 +546,15 @@ function rewriteM3u8(playlistText, baseUrl, headers) {
         nextIsPlaylist = false;
 
         if (isPlaylist) {
-            const token = encodeProxyToken(absUrl, headers);
+            const token = encodeProxyToken(absUrl, headers, full);
             return `${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`;
         }
         // Con USE_PROXY=1 el segmento pasa por nuestro server, salvo los de
         // hosts de publicidad conocidos (p.ej. tiktokcdn .image): esos van
         // directo para gastar lo mínimo.
-        if (USE_PROXY && !isKnownAdHost(absUrl)) {
+        if ((USE_PROXY || full) && !isKnownAdHost(absUrl)) {
             const token = encodeProxyToken(absUrl, headers);
-            return `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`;
+            return `${PUBLIC_URL}/hlsproxy/segment/${token}/${full ? 'seg.ts' : 'seg'}`;
         }
         return absUrl;
     });
@@ -564,7 +569,7 @@ async function handleHlsPlaylistProxy(req, res) {
             headers: data.headers, timeout: 15000, responseType: 'text',
             transformResponse: [(d) => d]
         });
-        const rewritten = rewriteM3u8(upstream.data, data.url, data.headers);
+        const rewritten = rewriteM3u8(upstream.data, data.url, data.headers, data.full);
         res.set('Access-Control-Allow-Origin', '*');
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewritten);
@@ -588,8 +593,14 @@ async function handleHlsSegmentProxy(req, res) {
     }
 }
 
+// PROXY_TXT=1 (opcional, APAGADO por defecto): los streams cuyo master es .txt
+// pasan también sus segmentos por el server, con headers. Sin esto, todo va
+// directo al CDN y los headers los intenta mandar el cliente (ver proxyHeaders
+// más abajo).
+const PROXY_TXT = process.env.PROXY_TXT === '1';
 function buildProxyPlaylistUrl(targetUrl, headers) {
-    const token = encodeProxyToken(targetUrl, headers);
+    const full = PROXY_TXT && /\.txt(\?|#|$)/i.test(targetUrl);
+    const token = encodeProxyToken(targetUrl, headers, full);
     return `${PUBLIC_URL}/hlsproxy/playlist/${token}/master.m3u8`;
 }
 
@@ -657,11 +668,18 @@ async function resolveStreamsFor(type, id) {
         const r = await resolveByServer(e.servername, e.embedUrl);
         if (!r) return null;
         console.log(`👉 [${e.servername}] Enlace a pasar al proxy: ${r.url} | Referer=${r.headers.Referer} Origin=${r.headers.Origin}`);
-        return {
+        const stream = {
             name: `PelisPedia - ${e.servername}`,
             title: `${e.language} - ${e.servername}`,
             url: buildProxyPlaylistUrl(r.url, r.headers)
         };
+        // Masters .txt (CDN de StreamWish en Cloudflare, CORS atado al origen del
+        // embed): le pedimos a Stremio que mande Referer/Origin/UA desde el
+        // cliente, sin pasar bytes por nuestro server.
+        if (/\.txt(\?|#|$)/i.test(r.url) && r.headers) {
+            stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: { ...r.headers } } };
+        }
+        return stream;
     }));
 
     const streams = resolved.filter(Boolean);
