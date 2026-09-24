@@ -96,6 +96,18 @@ function unpackEvalPacker(script) {
     });
 }
 
+// El embed trae varios links (hls2 = CDN firmado con asn atado a la red que
+// pidió el embed; hls4 = /stream/... en el propio dominio del embed, el que usa
+// el reproductor en el navegador y cuyos segmentos son públicos). Antes se
+// tomaba el PRIMERO que apareciera, y el orden cambia entre pedidos. Ahora
+// se prefiere hls4 y hls2 queda solo como respaldo.
+function pickVidHideHls(text) {
+    const m4 = text.match(/"hls4"\s*:\s*"([^"]+)"/);
+    const m2 = text.match(/"hls2"\s*:\s*"([^"]+)"/);
+    const m = m4 || m2;
+    return m ? m[1].replace(/\\\//g, '/') : null;
+}
+
 async function resolveVidHide(url) {
     try {
         const domain = new URL(url).hostname;
@@ -110,13 +122,17 @@ async function resolveVidHide(url) {
         if (packedMatch) {
             const unpacked = unpackEvalPacker(packedMatch[0]);
             if (unpacked) {
-                const hlsMatch = unpacked.match(/"hls[24]"\s*:\s*"([^"]+)"/);
-                if (hlsMatch) finalUrl = hlsMatch[1];
+                const picked = pickVidHideHls(unpacked);
+                if (picked) finalUrl = picked;
             }
         }
         if (!finalUrl) {
-            const rawMatch = html.match(/"hls[24]"\s*:\s*"([^"]+)"/) || html.match(/file\s*:\s*["']([^"']+)["']/i);
-            if (rawMatch) finalUrl = rawMatch[1];
+            const rawPicked = pickVidHideHls(html);
+            if (rawPicked) finalUrl = rawPicked;
+            else {
+                const fileMatch = html.match(/file\s*:\s*["']([^"']+)["']/i);
+                if (fileMatch) finalUrl = fileMatch[1];
+            }
         }
         if (!finalUrl) return null;
         if (!finalUrl.startsWith('http')) finalUrl = new URL(url).origin + finalUrl;
