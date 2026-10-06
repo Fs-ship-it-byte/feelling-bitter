@@ -3,8 +3,6 @@ const axios = require('axios');
 const crypto = require('crypto');
 const dns = require('dns');
 const net = require('net');
-const http = require('http');
-const https = require('https');
 
 // ---------------------------------------------------------------------------
 // Configuración obligatoria del gateway. Si falta algo, el servidor NO arranca.
@@ -74,19 +72,21 @@ function assertPublicTarget(rawUrl) {
     }
     if (net.isIP(host) && isPrivateIp(host)) throw new Error('Destino no permitido');
 }
-function safeLookup(hostname, options, cb) {
-    dns.lookup(hostname, options, (err, address, family) => {
-        if (err) return cb(err);
-        const list = Array.isArray(address) ? address : [{ address, family }];
-        if (list.some((a) => isPrivateIp(a.address))) return cb(new Error('Destino no permitido'));
-        cb(null, address, family);
-    });
+// Comprobación puntual (solo en los dos proxies, NO afecta a los resolvers):
+// además de mirar el host, resuelve su DNS y rechaza si alguna IP es privada.
+async function assertPublicTargetDns(rawUrl) {
+    assertPublicTarget(rawUrl);
+    const host = new URL(rawUrl).hostname.replace(/^\[|\]$/g, '');
+    if (net.isIP(host)) return;
+    const addrs = await dns.promises.lookup(host, { all: true });
+    if (!addrs.length || addrs.some((x) => isPrivateIp(x.address))) throw new Error('Destino no permitido');
 }
-axios.defaults.httpAgent = new http.Agent({ lookup: safeLookup });
-axios.defaults.httpsAgent = new https.Agent({ lookup: safeLookup });
-axios.defaults.maxRedirects = 3;
-axios.defaults.beforeRedirect = (options) => {
-    assertPublicTarget(`${options.protocol || 'https:'}//${options.hostname || options.host}`);
+// Opciones por petición (no globales) para los proxies: pocos redirects y cada salto se revisa.
+const PROXY_NET_OPTS = {
+    maxRedirects: 3,
+    beforeRedirect: (options) => {
+        assertPublicTarget(`${options.protocol || 'https:'}//${options.hostname || options.host}`);
+    }
 };
 
 const BASE = 'https://pelispedia.mov';
@@ -686,10 +686,10 @@ async function handleHlsPlaylistProxy(req, res) {
     const data = decodeProxyToken(req.params.token);
     if (!data) return res.status(400).send('Token inválido');
     try {
-        assertPublicTarget(data.url);
+        await assertPublicTargetDns(data.url);
         const upstream = await axios.get(data.url, {
             headers: data.headers, timeout: 15000, responseType: 'text',
-            transformResponse: [(d) => d]
+            transformResponse: [(d) => d], ...PROXY_NET_OPTS
         });
         const rewritten = rewriteM3u8(upstream.data, data.url, data.headers, data.full, { acct: data.acct, title: data.title });
         res.set('Access-Control-Allow-Origin', '*');
@@ -705,9 +705,9 @@ async function handleHlsSegmentProxy(req, res) {
     const data = decodeProxyToken(req.params.token);
     if (!data) return res.status(400).send('Token inválido');
     try {
-        assertPublicTarget(data.url);
+        await assertPublicTargetDns(data.url);
         const upstream = await axios.get(data.url, {
-            headers: data.headers, timeout: 20000, responseType: 'stream'
+            headers: data.headers, timeout: 20000, responseType: 'stream', ...PROXY_NET_OPTS
         });
         res.set('Access-Control-Allow-Origin', '*');
         if (upstream.headers['content-type']) res.set('Content-Type', upstream.headers['content-type']);
