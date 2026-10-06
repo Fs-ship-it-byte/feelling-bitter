@@ -1,9 +1,94 @@
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
+const dns = require('dns');
+const net = require('net');
+const http = require('http');
+const https = require('https');
+
+// ---------------------------------------------------------------------------
+// Configuración obligatoria del gateway. Si falta algo, el servidor NO arranca.
+//   GATEWAY_SECRET     = el mismo valor que en el Worker
+//   PROXY_SIGNING_KEY  = el mismo valor que en el Worker
+//   PLAYLIST_BASE_URL  = https://<tu-worker>.workers.dev/hls/viper   (sin barra final)
+// ---------------------------------------------------------------------------
+const GATEWAY_SECRET = process.env.GATEWAY_SECRET || '';
+const PROXY_SIGNING_KEY = process.env.PROXY_SIGNING_KEY || '';
+const PLAYLIST_BASE_URL = (process.env.PLAYLIST_BASE_URL || '').replace(/\/+$/, '');
+{
+    const problems = [];
+    if (GATEWAY_SECRET.length < 16) problems.push('GATEWAY_SECRET (mínimo 16 caracteres)');
+    if (PROXY_SIGNING_KEY.length < 16) problems.push('PROXY_SIGNING_KEY (mínimo 16 caracteres)');
+    if (!/^https:\/\/[^/]+\/hls\/[a-z0-9_-]+$/.test(PLAYLIST_BASE_URL)) problems.push('PLAYLIST_BASE_URL (debe ser https://<gateway>/hls/<addon>, sin barra final)');
+    if (problems.length) {
+        console.error('Configuración inválida o incompleta: ' + problems.join(', '));
+        process.exit(1);
+    }
+}
+const ENABLE_DEBUG = process.env.ENABLE_DEBUG === '1';
 
 const app = express();
-const PUBLIC_URL = (process.env.PUBLIC_URL || `http://127.0.0.1:${process.env.PORT || 7000}`).replace(/\/+$/, '');
+
+// Backend cerrado: TODAS las rutas exigen el secreto que pone el gateway.
+// Se responde 404 (no 401) para no delatar que aquí hay algo.
+const GATEWAY_SECRET_HASH = crypto.createHash('sha256').update(GATEWAY_SECRET).digest();
+app.use((req, res, next) => {
+    const got = crypto.createHash('sha256').update(String(req.get('X-Gateway-Secret') || '')).digest();
+    if (!crypto.timingSafeEqual(got, GATEWAY_SECRET_HASH)) return res.status(404).send('Not found');
+    next();
+});
+
+// ---------------------------------------------------------------------------
+// Protección contra SSRF: el proxy nunca conecta a localhost / IPs privadas,
+// ni siquiera tras redirects o resoluciones DNS engañosas.
+// ---------------------------------------------------------------------------
+function isPrivateIp(ip) {
+    if (net.isIPv4(ip)) {
+        const [a, b] = ip.split('.').map(Number);
+        return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) ||
+            (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
+            (a === 100 && b >= 64 && b <= 127) || a >= 224;
+    }
+    if (net.isIPv6(ip)) {
+        const x = ip.toLowerCase();
+        if (x === '::1' || x === '::') return true;
+        if (x.startsWith('fe80') || x.startsWith('fc') || x.startsWith('fd') || x.startsWith('ff')) return true;
+        const m4 = x.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+        if (m4) return isPrivateIp(m4[1]);
+        const mh = x.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+        if (mh) {
+            const hi = parseInt(mh[1], 16), lo = parseInt(mh[2], 16);
+            return isPrivateIp(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+        }
+        return false;
+    }
+    return true; // no es una IP válida
+}
+function assertPublicTarget(rawUrl) {
+    let u;
+    try { u = new URL(rawUrl); } catch (e) { throw new Error('URL inválida'); }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('Protocolo no permitido');
+    const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
+        throw new Error('Destino no permitido');
+    }
+    if (net.isIP(host) && isPrivateIp(host)) throw new Error('Destino no permitido');
+}
+function safeLookup(hostname, options, cb) {
+    dns.lookup(hostname, options, (err, address, family) => {
+        if (err) return cb(err);
+        const list = Array.isArray(address) ? address : [{ address, family }];
+        if (list.some((a) => isPrivateIp(a.address))) return cb(new Error('Destino no permitido'));
+        cb(null, address, family);
+    });
+}
+axios.defaults.httpAgent = new http.Agent({ lookup: safeLookup });
+axios.defaults.httpsAgent = new https.Agent({ lookup: safeLookup });
+axios.defaults.maxRedirects = 3;
+axios.defaults.beforeRedirect = (options) => {
+    assertPublicTarget(`${options.protocol || 'https:'}//${options.hostname || options.host}`);
+};
+
 const BASE = 'https://pelispedia.mov';
 const PS_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -440,14 +525,34 @@ async function resolveByServer(servername, embedUrl) {
     return null;
 }
 
-function encodeProxyToken(url, headers, full) {
-    const payload = { url, headers: headers || {} };
-    if (full) payload.full = true;   // solo cuando aplica: los tokens normales no cambian
-    return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+// Token firmado: base64url(JSON) + "." + base64url(HMAC-SHA256(PROXY_SIGNING_KEY, esa parte)).
+// Lleva url, headers, full (si aplica), acct (id de cuenta, lo pone el gateway) y title,
+// y caduca a las 12 h. El gateway verifica la misma firma con la misma clave.
+const TOKEN_TTL_SECONDS = 12 * 3600;
+function signTokenBody(body) {
+    return crypto.createHmac('sha256', PROXY_SIGNING_KEY).update(body).digest('base64url');
+}
+function encodeProxyToken(url, headers, full, meta) {
+    const payload = { url, headers: headers || {}, exp: Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS };
+    if (full) payload.full = true;   // solo cuando aplica
+    if (meta && meta.acct) payload.acct = String(meta.acct);
+    if (meta && meta.title) payload.title = String(meta.title).slice(0, 100);
+    const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+    return body + '.' + signTokenBody(body);
 }
 function decodeProxyToken(token) {
-    try { return JSON.parse(Buffer.from(token, 'base64url').toString('utf8')); }
-    catch (e) { return null; }
+    try {
+        const t = String(token);
+        const i = t.lastIndexOf('.');
+        if (i < 1) return null;
+        const body = t.slice(0, i);
+        const given = Buffer.from(t.slice(i + 1));
+        const expected = Buffer.from(signTokenBody(body));
+        if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+        const p = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+        if (!p || typeof p.url !== 'string' || typeof p.exp !== 'number' || p.exp < Date.now() / 1000) return null;
+        return p;
+    } catch (e) { return null; }
 }
 function makeAbsoluteUrl(url, base) {
     if (!url) return null;
@@ -528,7 +633,7 @@ const USE_PROXY = process.env.USE_PROXY === '1';
 // `full` (viene en el token, ver buildProxyPlaylistUrl): proxy de segmentos SOLO
 // para esta cadena de playlists (las .txt de StreamWish), con los headers del
 // token y con nombre .ts para que el reproductor los acepte.
-function rewriteM3u8(playlistText, baseUrl, headers, full) {
+function rewriteM3u8(playlistText, baseUrl, headers, full, meta) {
     const lines = playlistText.split(/\r?\n/);
     let nextIsPlaylist = false;
 
@@ -542,15 +647,15 @@ function rewriteM3u8(playlistText, baseUrl, headers, full) {
             if (upper.startsWith('#EXT-X-I-FRAME-STREAM-INF')) {
                 return line.replace(/URI="([^"]+)"/i, (m, uri) => {
                     const abs = makeAbsoluteUrl(uri, baseUrl.replace(/\/[^/]*$/, ''));
-                    const token = encodeProxyToken(abs, headers, full);
-                    return `URI="${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8"`;
+                    const token = encodeProxyToken(abs, headers, full, meta);
+                    return `URI="${PLAYLIST_BASE_URL}/playlist/${token}/sub.m3u8"`;
                 });
             }
 
             const rewritten = line.replace(/URI="([^"]+)"/i, (m, uri) => {
                 const abs = makeAbsoluteUrl(uri, baseUrl.replace(/\/[^/]*$/, ''));
-                const token = encodeProxyToken(abs, headers);
-                return `URI="${PUBLIC_URL}/hlsproxy/segment/${token}/seg"`;
+                const token = encodeProxyToken(abs, headers, false, meta);
+                return `URI="${PLAYLIST_BASE_URL}/segment/${token}/seg"`;
             });
 
             nextIsPlaylist = upper.startsWith('#EXT-X-STREAM-INF');
@@ -562,15 +667,15 @@ function rewriteM3u8(playlistText, baseUrl, headers, full) {
         nextIsPlaylist = false;
 
         if (isPlaylist) {
-            const token = encodeProxyToken(absUrl, headers, full);
-            return `${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`;
+            const token = encodeProxyToken(absUrl, headers, full, meta);
+            return `${PLAYLIST_BASE_URL}/playlist/${token}/sub.m3u8`;
         }
         // Con USE_PROXY=1 el segmento pasa por nuestro server, salvo los de
         // hosts de publicidad conocidos (p.ej. tiktokcdn .image): esos van
         // directo para gastar lo mínimo.
         if ((USE_PROXY || full) && !isKnownAdHost(absUrl)) {
-            const token = encodeProxyToken(absUrl, headers);
-            return `${PUBLIC_URL}/hlsproxy/segment/${token}/${full ? 'seg.ts' : 'seg'}`;
+            const token = encodeProxyToken(absUrl, headers, false, meta);
+            return `${PLAYLIST_BASE_URL}/segment/${token}/${full ? 'seg.ts' : 'seg'}`;
         }
         return absUrl;
     });
@@ -581,16 +686,18 @@ async function handleHlsPlaylistProxy(req, res) {
     const data = decodeProxyToken(req.params.token);
     if (!data) return res.status(400).send('Token inválido');
     try {
+        assertPublicTarget(data.url);
         const upstream = await axios.get(data.url, {
             headers: data.headers, timeout: 15000, responseType: 'text',
             transformResponse: [(d) => d]
         });
-        const rewritten = rewriteM3u8(upstream.data, data.url, data.headers, data.full);
+        const rewritten = rewriteM3u8(upstream.data, data.url, data.headers, data.full, { acct: data.acct, title: data.title });
         res.set('Access-Control-Allow-Origin', '*');
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewritten);
     } catch (e) {
-        res.status(502).send('No se pudo obtener el playlist: ' + e.message);
+        console.log('Playlist no disponible:', e.message);
+        res.status(502).send('No se pudo obtener el playlist');
     }
 }
 
@@ -598,6 +705,7 @@ async function handleHlsSegmentProxy(req, res) {
     const data = decodeProxyToken(req.params.token);
     if (!data) return res.status(400).send('Token inválido');
     try {
+        assertPublicTarget(data.url);
         const upstream = await axios.get(data.url, {
             headers: data.headers, timeout: 20000, responseType: 'stream'
         });
@@ -614,10 +722,10 @@ async function handleHlsSegmentProxy(req, res) {
 // directo al CDN y los headers los intenta mandar el cliente (ver proxyHeaders
 // más abajo).
 const PROXY_TXT = process.env.PROXY_TXT === '1';
-function buildProxyPlaylistUrl(targetUrl, headers) {
+function buildProxyPlaylistUrl(targetUrl, headers, meta) {
     const full = PROXY_TXT && /\.txt(\?|#|$)/i.test(targetUrl);
-    const token = encodeProxyToken(targetUrl, headers, full);
-    return `${PUBLIC_URL}/hlsproxy/playlist/${token}/master.m3u8`;
+    const token = encodeProxyToken(targetUrl, headers, full, meta);
+    return `${PLAYLIST_BASE_URL}/playlist/${token}/master.m3u8`;
 }
 
 app.get('/hlsproxy/playlist/:token/*', handleHlsPlaylistProxy);
@@ -647,7 +755,11 @@ const inFlightRequests = new Map();
 
 app.get('/stream/:type/:idWithExt', async (req, res) => {
     const id = req.params.idWithExt.replace(/\.json$/, '');
-    const requestKey = `${req.params.type}:${id}`;
+    // X-Account-Id lo pone el gateway; va dentro de los tokens firmados.
+    const acct = String(req.get('X-Account-Id') || '');
+    if (!/^[A-Za-z0-9_-]{1,40}$/.test(acct)) return res.status(400).json({ streams: [] });
+    // la clave incluye la cuenta: dos cuentas nunca comparten una resolución en curso
+    const requestKey = `${acct}|${req.params.type}:${id}`;
 
     if (inFlightRequests.has(requestKey)) {
         console.log(`Pedido duplicado detectado para ${requestKey} -- reusando la resolución en curso en vez de arrancar otra.`);
@@ -659,7 +771,7 @@ app.get('/stream/:type/:idWithExt', async (req, res) => {
         }
     }
 
-    const resultPromise = resolveStreamsFor(req.params.type, id);
+    const resultPromise = resolveStreamsFor(req.params.type, id, acct);
     inFlightRequests.set(requestKey, resultPromise);
     try {
         const streams = await resultPromise;
@@ -672,7 +784,7 @@ app.get('/stream/:type/:idWithExt', async (req, res) => {
     }
 });
 
-async function resolveStreamsFor(type, id) {
+async function resolveStreamsFor(type, id, acct) {
     const t0 = Date.now();
     const [imdbId, season, episode] = id.split(':');
     console.log(`--- Pedido: ${type} ${id} ---`);
@@ -687,7 +799,7 @@ async function resolveStreamsFor(type, id) {
         const stream = {
             name: `PelisPedia - ${e.servername}`,
             title: `${e.language} - ${e.servername}`,
-            url: buildProxyPlaylistUrl(r.url, r.headers)
+            url: buildProxyPlaylistUrl(r.url, r.headers, { acct, title: id })
         };
         // Masters .txt (CDN de StreamWish en Cloudflare, CORS atado al origen del
         // embed): le pedimos a Stremio que mande Referer/Origin/UA desde el
@@ -703,164 +815,133 @@ async function resolveStreamsFor(type, id) {
     return streams;
 }
 
-app.get('/debug/browsercheck', async (req, res) => {
-    res.set('Content-Type', 'text/plain');
-    if (!puppeteer) return res.status(500).send('El paquete "puppeteer" no está instalado (require falló al arrancar el server).');
-    try {
+// Rutas de diagnóstico: apagadas por defecto. Solo existen con ENABLE_DEBUG=1
+// (y, como todo el backend, siguen exigiendo el secreto del gateway).
+// /debug/adcheck se eliminó: llamaba a looksLikeAdUrl, que no existe.
+if (ENABLE_DEBUG) {
+    app.get('/debug/browsercheck', async (req, res) => {
+        res.set('Content-Type', 'text/plain');
+        if (!puppeteer) return res.status(500).send('El paquete "puppeteer" no está instalado (require falló al arrancar el server).');
+        try {
+            const t0 = Date.now();
+            const browser = await getBrowser();
+            const page = await browser.newPage();
+            await page.goto('https://example.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
+            const title = await page.title();
+            await page.close();
+            res.send(`OK -- Chromium arrancó y navegó en ${Date.now() - t0}ms.\nTítulo de prueba (example.com): ${title}`);
+        } catch (e) {
+            res.status(500).send(`ERROR al arrancar/usar Puppeteer: ${e.message}\n\nStack:\n${e.stack}`);
+        }
+    });
+
+    app.get('/debug/resolve', async (req, res) => {
+        const { server, url, force } = req.query;
+        if (!server || !url) return res.status(400).send('Uso: /debug/resolve?server=streamwish&url=<embed>&force=browser (force es opcional)');
+        res.set('Content-Type', 'text/plain');
+        const log = [];
         const t0 = Date.now();
-        const browser = await getBrowser();
-        const page = await browser.newPage();
-        await page.goto('https://example.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
-        const title = await page.title();
-        await page.close();
-        res.send(`OK -- Chromium arrancó y navegó en ${Date.now() - t0}ms.\nTítulo de prueba (example.com): ${title}`);
-    } catch (e) {
-        res.status(500).send(`ERROR al arrancar/usar Puppeteer: ${e.message}\n\nStack:\n${e.stack}`);
-    }
-});
-
-app.get('/debug/resolve', async (req, res) => {
-    const { server, url, force } = req.query;
-    if (!server || !url) return res.status(400).send('Uso: /debug/resolve?server=streamwish&url=<embed>&force=browser (force es opcional)');
-    res.set('Content-Type', 'text/plain');
-    const log = [];
-    const t0 = Date.now();
-    try {
-        let result;
-        if (force === 'browser') {
-            log.push('Forzando resolución vía navegador (saltando el método rápido)...');
-            result = await resolveViaBrowser(url);
-        } else {
-            result = await resolveByServer(server, url);
+        try {
+            let result;
+            if (force === 'browser') {
+                log.push('Forzando resolución vía navegador (saltando el método rápido)...');
+                result = await resolveViaBrowser(url);
+            } else {
+                result = await resolveByServer(server, url);
+            }
+            log.push(`[${Date.now() - t0}ms] Resultado: ${result ? JSON.stringify(result, null, 2) : 'null'}`);
+        } catch (e) {
+            log.push(`EXCEPCIÓN: ${e.message}\n${e.stack}`);
         }
-        log.push(`[${Date.now() - t0}ms] Resultado: ${result ? JSON.stringify(result, null, 2) : 'null'}`);
-    } catch (e) {
-        log.push(`EXCEPCIÓN: ${e.message}\n${e.stack}`);
-    }
-    res.send(log.join('\n'));
-});
-
-app.get('/debug/embeds', async (req, res) => {
-    const { imdb, season, episode } = req.query;
-    if (!imdb) return res.status(400).send('Falta ?imdb=ttXXXXXXX');
-    res.set('Content-Type', 'text/plain');
-    try {
-        const embeds = await getDecryptedEmbeds(imdb, season, episode);
-        res.send(JSON.stringify(embeds, null, 2));
-    } catch (e) {
-        res.status(500).send('Error: ' + e.message);
-    }
-});
-
-app.get('/debug/rawfetch', async (req, res) => {
-    const proxyUrl = req.query.url;
-    if (!proxyUrl) return res.status(400).send('Falta ?url=<link completo de /hlsproxy/playlist/.../algo.m3u8>');
-    const m = proxyUrl.match(/\/hlsproxy\/playlist\/([^/]+)\//);
-    if (!m) return res.status(400).send('Esa URL no es un link de /hlsproxy/playlist/...');
-    const data = decodeProxyToken(m[1]);
-    if (!data) return res.status(400).send('Token inválido');
-
-    res.set('Content-Type', 'text/plain');
-    try {
-        const upstream = await axios.get(data.url, {
-            headers: data.headers, timeout: 12000, responseType: 'text',
-            transformResponse: [(d) => d], validateStatus: () => true
-        });
-        res.send(
-            `URL real consultada: ${data.url}\n` +
-            `Headers usados: ${JSON.stringify(data.headers, null, 2)}\n` +
-            `Status: ${upstream.status}\n\n` +
-            `--- BODY CRUDO (sin filtrar) ---\n${upstream.data}`
-        );
-    } catch (e) {
-        res.status(500).send('Error: ' + e.message);
-    }
-});
-
-app.get('/debug/adcheck', async (req, res) => {
-    const masterUrl = req.query.url;
-    if (!masterUrl) return res.status(400).send('Falta ?url= (opcional: &referer=&origin=)');
-    res.set('Content-Type', 'text/plain');
-    const extraHeaders = { 'User-Agent': PS_UA };
-    if (req.query.referer) extraHeaders.Referer = req.query.referer;
-    if (req.query.origin) extraHeaders.Origin = req.query.origin;
-    try {
-        const masterResp = await axios.get(masterUrl, { headers: extraHeaders, timeout: 12000, responseType: 'text', transformResponse: [(d) => d] });
-        const subLineRaw = String(masterResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
-        const subLine = makeAbsoluteUrl(subLineRaw.trim(), masterUrl.replace(/\/[^/]*$/, ''));
-        const subResp = await axios.get(subLine, { headers: extraHeaders, timeout: 12000, responseType: 'text', transformResponse: [(d) => d] });
-        const lines = String(subResp.data).split(/\r?\n/);
-        let total = 0, ads = 0;
-        const sampleReal = [];
-        const sampleAds = [];
-        for (const line of lines) {
-            const t = line.trim();
-            if (!t || t.startsWith('#')) continue;
-            const abs = /^https?:\/\//i.test(t) ? t : makeAbsoluteUrl(t, subLine.replace(/\/[^/]*$/, ''));
-            total++;
-            if (looksLikeAdUrl(abs)) { ads++; if (sampleAds.length < 3) sampleAds.push(abs); }
-            else { if (sampleReal.length < 3) sampleReal.push(abs); }
-        }
-        res.send(
-            `Total de líneas de segmento en la sub-playlist: ${total}\n` +
-            `Detectadas como publicidad (se filtrarían): ${ads}\n` +
-            `Quedarían como reales tras el filtro: ${total - ads}\n\n` +
-            `Ejemplos de "real": ${JSON.stringify(sampleReal, null, 2)}\n\n` +
-            `Ejemplos de "ad" filtrado: ${JSON.stringify(sampleAds, null, 2)}`
-        );
-    } catch (e) {
-        res.status(500).send('Error: ' + e.message);
-    }
-});
-
-app.get('/debug/fullchain', async (req, res) => {
-    const masterUrl = req.query.url;
-    if (!masterUrl) return res.status(400).send('Falta ?url= (opcional: &referer=&origin=)');
-    res.set('Content-Type', 'text/plain');
-    const log = [];
-    const t0 = Date.now();
-    const p = (msg) => log.push(`[${Date.now() - t0}ms] ${msg}`);
-
-    const extraHeaders = { 'User-Agent': PS_UA };
-    if (req.query.referer) extraHeaders.Referer = req.query.referer;
-    if (req.query.origin) extraHeaders.Origin = req.query.origin;
-    p(`Headers usados: ${JSON.stringify(extraHeaders)}`);
-
-    async function fetchText(u) {
-        return axios.get(u, { timeout: 12000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true, headers: extraHeaders });
-    }
-    async function fetchBinary(u) {
-        return axios.get(u, { timeout: 12000, responseType: 'arraybuffer', validateStatus: () => true, headers: extraHeaders });
-    }
-
-    try {
-        const masterResp = await fetchText(masterUrl);
-        p(`MASTER status ${masterResp.status}, largo ${String(masterResp.data).length}`);
-        if (masterResp.status !== 200) return res.send(log.join('\n') + '\n\nBody:\n' + String(masterResp.data).slice(0, 500));
-
-        const subLineRaw = String(masterResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
-        if (!subLineRaw) return res.send(log.join('\n') + '\n\nEl master no tiene sub-playlist.');
-        const subLine = makeAbsoluteUrl(subLineRaw.trim(), masterUrl.replace(/\/[^/]*$/, ''));
-        p(`Sub-playlist: ${subLine}`);
-
-        const subResp = await fetchText(subLine);
-        p(`SUB-PLAYLIST status ${subResp.status}, largo ${String(subResp.data).length}`);
-        if (subResp.status !== 200) return res.send(log.join('\n') + '\n\nBody:\n' + String(subResp.data).slice(0, 500));
-        p('Primeros 300 chars de la sub-playlist:\n' + String(subResp.data).slice(0, 300));
-
-        const segLineRaw = String(subResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
-        if (!segLineRaw) return res.send(log.join('\n') + '\n\nSin segmentos.');
-        const segLine = makeAbsoluteUrl(segLineRaw.trim(), subLine.replace(/\/[^/]*$/, ''));
-        p(`Primer segmento: ${segLine}`);
-
-        const segResp = await fetchBinary(segLine);
-        p(`SEGMENTO status ${segResp.status}, bytes: ${segResp.data ? segResp.data.byteLength : 0}`);
         res.send(log.join('\n'));
-    } catch (e) {
-        p('EXCEPCIÓN: ' + e.message);
-        res.status(500).send(log.join('\n'));
-    }
-});
+    });
+
+    app.get('/debug/embeds', async (req, res) => {
+        const { imdb, season, episode } = req.query;
+        if (!imdb) return res.status(400).send('Falta ?imdb=ttXXXXXXX');
+        res.set('Content-Type', 'text/plain');
+        try {
+            const embeds = await getDecryptedEmbeds(imdb, season, episode);
+            res.send(JSON.stringify(embeds, null, 2));
+        } catch (e) {
+            res.status(500).send('Error: ' + e.message);
+        }
+    });
+
+    app.get('/debug/rawfetch', async (req, res) => {
+        const proxyUrl = req.query.url;
+        if (!proxyUrl) return res.status(400).send('Falta ?url=<link completo de /hlsproxy/playlist/.../algo.m3u8>');
+        const m = proxyUrl.match(/\/hlsproxy\/playlist\/([^/]+)\//);
+        if (!m) return res.status(400).send('Esa URL no es un link de /hlsproxy/playlist/...');
+        const data = decodeProxyToken(m[1]);
+        if (!data) return res.status(400).send('Token inválido');
+
+        res.set('Content-Type', 'text/plain');
+        try {
+            const upstream = await axios.get(data.url, {
+                headers: data.headers, timeout: 12000, responseType: 'text',
+                transformResponse: [(d) => d], validateStatus: () => true
+            });
+            res.send(
+                `URL real consultada: ${data.url}\n` +
+                `Headers usados: ${JSON.stringify(data.headers, null, 2)}\n` +
+                `Status: ${upstream.status}\n\n` +
+                `--- BODY CRUDO (sin filtrar) ---\n${upstream.data}`
+            );
+        } catch (e) {
+            res.status(500).send('Error: ' + e.message);
+        }
+    });
+
+    app.get('/debug/fullchain', async (req, res) => {
+        const masterUrl = req.query.url;
+        if (!masterUrl) return res.status(400).send('Falta ?url= (opcional: &referer=&origin=)');
+        res.set('Content-Type', 'text/plain');
+        const log = [];
+        const t0 = Date.now();
+        const p = (msg) => log.push(`[${Date.now() - t0}ms] ${msg}`);
+
+        const extraHeaders = { 'User-Agent': PS_UA };
+        if (req.query.referer) extraHeaders.Referer = req.query.referer;
+        if (req.query.origin) extraHeaders.Origin = req.query.origin;
+        p(`Headers usados: ${JSON.stringify(extraHeaders)}`);
+
+        async function fetchText(u) {
+            return axios.get(u, { timeout: 12000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true, headers: extraHeaders });
+        }
+        async function fetchBinary(u) {
+            return axios.get(u, { timeout: 12000, responseType: 'arraybuffer', validateStatus: () => true, headers: extraHeaders });
+        }
+
+        try {
+            const masterResp = await fetchText(masterUrl);
+            p(`MASTER status ${masterResp.status}, largo ${String(masterResp.data).length}`);
+            if (masterResp.status !== 200) return res.send(log.join('\n') + '\n\nBody:\n' + String(masterResp.data).slice(0, 500));
+
+            const subLineRaw = String(masterResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
+            if (!subLineRaw) return res.send(log.join('\n') + '\n\nEl master no tiene sub-playlist.');
+            const subLine = makeAbsoluteUrl(subLineRaw.trim(), masterUrl.replace(/\/[^/]*$/, ''));
+            p(`Sub-playlist: ${subLine}`);
+
+            const subResp = await fetchText(subLine);
+            p(`SUB-PLAYLIST status ${subResp.status}, largo ${String(subResp.data).length}`);
+            if (subResp.status !== 200) return res.send(log.join('\n') + '\n\nBody:\n' + String(subResp.data).slice(0, 500));
+            p('Primeros 300 chars de la sub-playlist:\n' + String(subResp.data).slice(0, 300));
+
+            const segLineRaw = String(subResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
+            if (!segLineRaw) return res.send(log.join('\n') + '\n\nSin segmentos.');
+            const segLine = makeAbsoluteUrl(segLineRaw.trim(), subLine.replace(/\/[^/]*$/, ''));
+            p(`Primer segmento: ${segLine}`);
+
+            const segResp = await fetchBinary(segLine);
+            p(`SEGMENTO status ${segResp.status}, bytes: ${segResp.data ? segResp.data.byteLength : 0}`);
+            res.send(log.join('\n'));
+        } catch (e) {
+            p('EXCEPCIÓN: ' + e.message);
+            res.status(500).send(log.join('\n'));
+        }
+    });
+}
 
 app.get('/', (req, res) => {
     res.json({ status: 'online', addon: 'PelisPedia Standalone' });
