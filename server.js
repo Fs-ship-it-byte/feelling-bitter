@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
+const https = require('https');
 
 const app = express();
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://127.0.0.1:${process.env.PORT || 7000}`).replace(/\/+$/, '');
@@ -110,7 +111,7 @@ function unpackEvalPacker(script) {
 // el reproductor en el navegador y cuyos segmentos son públicos). Antes se
 // tomaba el PRIMERO que apareciera, y el orden cambia entre pedidos. Ahora
 // se prefiere hls4 y hls2 queda solo como respaldo.
-const VIDHIDE_QUICK_TIMEOUT = parseInt(process.env.VIDHIDE_QUICK_TIMEOUT || '7000', 10);
+const VIDHIDE_QUICK_TIMEOUT = parseInt(process.env.VIDHIDE_QUICK_TIMEOUT || '5000', 10);
 function pickVidHideHls(text) {
     const isHls = (v) => typeof v === 'string' && /\.(?:m3u8|txt)(?:\?|#|$)/i.test(v);
     for (const key of ['hls4', 'hls3', 'hls2']) {
@@ -127,6 +128,7 @@ function pickVidHideHls(text) {
 // Baja el HTML del embed probando dos juegos de headers EN PARALELO (Referer de
 // PelisPedia, que es donde vive el player, y Referer del propio dominio). Gana
 // el primero que responda texto; tope corto para no quemar 12s antes del navegador.
+const ipv4Agent = new https.Agent({ family: 4, keepAlive: false });
 async function fetchEmbedHtml(url) {
     const origin = new URL(url).origin;
     const common = {
@@ -134,28 +136,46 @@ async function fetchEmbedHtml(url) {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
     };
+    // Un timeout "a secas" (sin status) apunta a conexión colgada, no a un 403:
+    // por eso una variante fuerza IPv4 (Render a veces intenta IPv6 sin salida).
     const variants = [
-        { ...common, 'Referer': BASE + '/' },
-        { ...common, 'Referer': origin + '/' }
+        { headers: { ...common, 'Referer': BASE + '/' }, agent: ipv4Agent },
+        { headers: { ...common, 'Referer': origin + '/' }, agent: ipv4Agent },
+        { headers: { ...common, 'Referer': BASE + '/' }, agent: undefined }
     ];
-    const tryOne = async (headers) => {
-        const r = await axios.get(url, {
-            headers, timeout: VIDHIDE_QUICK_TIMEOUT, responseType: 'text',
+    const tryOne = async (v) => {
+        const cfg = {
+            headers: v.headers, timeout: VIDHIDE_QUICK_TIMEOUT, responseType: 'text',
             transformResponse: [(d) => d], maxRedirects: 5
-        });
+        };
+        if (v.agent) cfg.httpsAgent = v.agent;
+        const r = await axios.get(url, cfg);
         if (typeof r.data !== 'string' || r.data.length < 200) throw new Error('respuesta vacía o no-texto');
         return r.data;
     };
     return Promise.any(variants.map(tryOne)).catch((agg) => {
-        const first = agg && agg.errors && agg.errors[0];
-        throw first || agg;
+        throw (agg && agg.errors && agg.errors[0]) || agg;
     });
 }
 
+let _vhQuickFails = 0;
+let _vhSkipQuickUntil = 0;
 async function resolveVidHide(url) {
     try {
         const domain = new URL(url).hostname;
-        const html = await fetchEmbedHtml(url);
+        if (Date.now() < _vhSkipQuickUntil) return null;   // el rápido viene fallando: directo al navegador
+        let html;
+        try {
+            html = await fetchEmbedHtml(url);
+            _vhQuickFails = 0;
+        } catch (err) {
+            if (++_vhQuickFails >= 3) {
+                _vhSkipQuickUntil = Date.now() + 10 * 60 * 1000;
+                _vhQuickFails = 0;
+                console.log('[VidHide] El método rápido falló 3 veces seguidas: lo salto por 10 min y voy directo al navegador.');
+            }
+            throw err;
+        }
         let finalUrl = null;
 
         const packedMatch = html.match(/eval\(function\(p,a,c,k,e,[rd]\)[\s\S]*?\.split\('\|'\)[^)]*\)\)/);
@@ -455,21 +475,21 @@ async function resolveViaBrowserImpl(embedUrl, timeoutMs) {
 // Cola: un solo Chromium trabajando a la vez (configurable). En Render los
 // lanzamientos simultáneos agotan memoria ("WS endpoint" timeout) y todo se
 // vuelve más lento. Si el pedido ya respondió (ctx.cancelled), se salta.
-const BROWSER_CONCURRENCY = parseInt(process.env.BROWSER_CONCURRENCY || '1', 10);
+const BROWSER_CONCURRENCY = parseInt(process.env.BROWSER_CONCURRENCY || '2', 10);
 let _browserActive = 0;
 const _browserWaiters = [];
-async function acquireBrowserSlot() {
+async function acquireBrowserSlot(priority) {
     if (_browserActive < BROWSER_CONCURRENCY) { _browserActive++; return; }
-    await new Promise((resolve) => _browserWaiters.push(resolve));
+    await new Promise((resolve) => { priority ? _browserWaiters.unshift(resolve) : _browserWaiters.push(resolve); });
 }
 function releaseBrowserSlot() {
     const next = _browserWaiters.shift();
     if (next) next();           // el slot pasa directo al siguiente
     else _browserActive--;
 }
-async function resolveViaBrowser(embedUrl, timeoutMs, ctx) {
+async function resolveViaBrowser(embedUrl, timeoutMs, ctx, priority) {
     if (ctx && ctx.cancelled) return null;
-    await acquireBrowserSlot();
+    await acquireBrowserSlot(priority);
     try {
         if (ctx && ctx.cancelled) return null;
         return await resolveViaBrowserImpl(embedUrl, timeoutMs);
@@ -484,7 +504,7 @@ async function resolveByServer(servername, embedUrl, ctx) {
     if (name === 'vidhide') {
         const quick = await resolveVidHide(embedUrl);
         if (quick) return quick;
-        return resolveViaBrowser(embedUrl, undefined, ctx);
+        return resolveViaBrowser(embedUrl, undefined, ctx, true);
     }
 
     if (name === 'streamwish') {
@@ -766,8 +786,8 @@ async function resolveStreamsFor(type, id) {
 
     // Tope total y salida anticipada: no esperamos al Puppeteer lento si ya hay
     // algo que mostrar. Stremio se rinde pronto; mejor 1-2 streams a tiempo.
-    const DEADLINE_MS = parseInt(process.env.RESOLVE_DEADLINE_MS || '25000', 10);
-    const GRACE_MS = parseInt(process.env.RESOLVE_GRACE_MS || '6000', 10);
+    const DEADLINE_MS = parseInt(process.env.RESOLVE_DEADLINE_MS || '50000', 10);
+    const GRACE_MS = parseInt(process.env.RESOLVE_GRACE_MS || '20000', 10);
     await new Promise((resolveAll) => {
         let pending = embeds.length;
         let graceTimer = null;
