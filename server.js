@@ -44,9 +44,18 @@ async function getDecryptedEmbeds(imdbId, season, episode) {
     const url = buildVidUrl(imdbId, season, episode);
     const resp = await axios.get(url, {
         headers: { 'User-Agent': PS_UA, 'Referer': BASE + '/' },
-        timeout: 12000
+        timeout: 12000,
+        responseType: 'text',
+        transformResponse: [(d) => d]
     });
-    const html = resp.data;
+    let html = resp.data;
+    if (Buffer.isBuffer(html)) html = html.toString('utf8');
+    if (typeof html !== 'string') {
+        // axios a veces entrega objeto/vacío (JSON, error del sitio): evita "html.match is not a function"
+        try { html = JSON.stringify(html); } catch (e) { html = ''; }
+        console.log(`[Embeds] Respuesta no-texto de ${url} (status ${resp.status}); sin embeds.`);
+        if (!html || html === 'null' || html === 'undefined') return [];
+    }
 
     const challengeMatch = html.match(/POW_CHALLENGE\s*=\s*'([^']+)'/);
     const difficultyMatch = html.match(/POW_DIFFICULTY\s*=\s*(\d+)/);
@@ -101,21 +110,52 @@ function unpackEvalPacker(script) {
 // el reproductor en el navegador y cuyos segmentos son públicos). Antes se
 // tomaba el PRIMERO que apareciera, y el orden cambia entre pedidos. Ahora
 // se prefiere hls4 y hls2 queda solo como respaldo.
+const VIDHIDE_QUICK_TIMEOUT = parseInt(process.env.VIDHIDE_QUICK_TIMEOUT || '7000', 10);
 function pickVidHideHls(text) {
-    const m4 = text.match(/"hls4"\s*:\s*"([^"]+)"/);
-    const m2 = text.match(/"hls2"\s*:\s*"([^"]+)"/);
-    const m = m4 || m2;
-    return m ? m[1].replace(/\\\//g, '/') : null;
+    const isHls = (v) => typeof v === 'string' && /\.(?:m3u8|txt)(?:\?|#|$)/i.test(v);
+    for (const key of ['hls4', 'hls3', 'hls2']) {
+        const re = new RegExp('"' + key + '"\\s*:\\s*"([^"]+)"');
+        const m = text.match(re);
+        if (m) {
+            const v = m[1].replace(/\\\//g, '/');
+            if (isHls(v)) return v;
+        }
+    }
+    return null;
+}
+
+// Baja el HTML del embed probando dos juegos de headers EN PARALELO (Referer de
+// PelisPedia, que es donde vive el player, y Referer del propio dominio). Gana
+// el primero que responda texto; tope corto para no quemar 12s antes del navegador.
+async function fetchEmbedHtml(url) {
+    const origin = new URL(url).origin;
+    const common = {
+        'User-Agent': PS_UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
+    };
+    const variants = [
+        { ...common, 'Referer': BASE + '/' },
+        { ...common, 'Referer': origin + '/' }
+    ];
+    const tryOne = async (headers) => {
+        const r = await axios.get(url, {
+            headers, timeout: VIDHIDE_QUICK_TIMEOUT, responseType: 'text',
+            transformResponse: [(d) => d], maxRedirects: 5
+        });
+        if (typeof r.data !== 'string' || r.data.length < 200) throw new Error('respuesta vacía o no-texto');
+        return r.data;
+    };
+    return Promise.any(variants.map(tryOne)).catch((agg) => {
+        const first = agg && agg.errors && agg.errors[0];
+        throw first || agg;
+    });
 }
 
 async function resolveVidHide(url) {
     try {
         const domain = new URL(url).hostname;
-        const resp = await axios.get(url, {
-            headers: { 'User-Agent': PS_UA, 'Referer': `https://${domain}/` },
-            timeout: 12000
-        });
-        const html = resp.data;
+        const html = await fetchEmbedHtml(url);
         let finalUrl = null;
 
         const packedMatch = html.match(/eval\(function\(p,a,c,k,e,[rd]\)[\s\S]*?\.split\('\|'\)[^)]*\)\)/);
@@ -241,7 +281,7 @@ async function getBrowser() {
     return _browserInstance;
 }
 
-async function resolveViaBrowser(embedUrl, timeoutMs) {
+async function resolveViaBrowserImpl(embedUrl, timeoutMs) {
     timeoutMs = timeoutMs || 30000;
     if (!puppeteer) return null;
 
@@ -412,20 +452,46 @@ async function resolveViaBrowser(embedUrl, timeoutMs) {
     }
 }
 
-async function resolveByServer(servername, embedUrl) {
+// Cola: un solo Chromium trabajando a la vez (configurable). En Render los
+// lanzamientos simultáneos agotan memoria ("WS endpoint" timeout) y todo se
+// vuelve más lento. Si el pedido ya respondió (ctx.cancelled), se salta.
+const BROWSER_CONCURRENCY = parseInt(process.env.BROWSER_CONCURRENCY || '1', 10);
+let _browserActive = 0;
+const _browserWaiters = [];
+async function acquireBrowserSlot() {
+    if (_browserActive < BROWSER_CONCURRENCY) { _browserActive++; return; }
+    await new Promise((resolve) => _browserWaiters.push(resolve));
+}
+function releaseBrowserSlot() {
+    const next = _browserWaiters.shift();
+    if (next) next();           // el slot pasa directo al siguiente
+    else _browserActive--;
+}
+async function resolveViaBrowser(embedUrl, timeoutMs, ctx) {
+    if (ctx && ctx.cancelled) return null;
+    await acquireBrowserSlot();
+    try {
+        if (ctx && ctx.cancelled) return null;
+        return await resolveViaBrowserImpl(embedUrl, timeoutMs);
+    } finally {
+        releaseBrowserSlot();
+    }
+}
+
+async function resolveByServer(servername, embedUrl, ctx) {
     const name = (servername || '').toLowerCase();
 
     if (name === 'vidhide') {
         const quick = await resolveVidHide(embedUrl);
         if (quick) return quick;
-        return resolveViaBrowser(embedUrl);
+        return resolveViaBrowser(embedUrl, undefined, ctx);
     }
 
     if (name === 'streamwish') {
         const quick = await resolveStreamWish(embedUrl);
         if (quick) return quick;
         console.log('[StreamWish] Método rápido no encontró nada, probando con navegador...');
-        return resolveViaBrowser(embedUrl);
+        return resolveViaBrowser(embedUrl, undefined, ctx);
     }
 
     if (name === 'voe') {
@@ -680,9 +746,9 @@ async function resolveStreamsFor(type, id) {
     const embeds = await getDecryptedEmbeds(imdbId, season, episode);
     console.log(`[${Date.now() - t0}ms] Embeds descifrados: ${embeds.length} (${embeds.map(e => e.servername).join(', ')})`);
 
-    const resolved = await Promise.all(embeds.map(async (e) => {
-        const r = await resolveByServer(e.servername, e.embedUrl);
-        if (!r) return null;
+    const ctx = { cancelled: false };
+    const streams = [];
+    const buildStream = (e, r) => {
         console.log(`👉 [${e.servername}] Enlace a pasar al proxy: ${r.url} | Referer=${r.headers.Referer} Origin=${r.headers.Origin}`);
         const stream = {
             name: `PelisPedia - ${e.servername}`,
@@ -696,9 +762,32 @@ async function resolveStreamsFor(type, id) {
             stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: { ...r.headers } } };
         }
         return stream;
-    }));
+    };
 
-    const streams = resolved.filter(Boolean);
+    // Tope total y salida anticipada: no esperamos al Puppeteer lento si ya hay
+    // algo que mostrar. Stremio se rinde pronto; mejor 1-2 streams a tiempo.
+    const DEADLINE_MS = parseInt(process.env.RESOLVE_DEADLINE_MS || '25000', 10);
+    const GRACE_MS = parseInt(process.env.RESOLVE_GRACE_MS || '6000', 10);
+    await new Promise((resolveAll) => {
+        let pending = embeds.length;
+        let graceTimer = null;
+        const finish = () => { clearTimeout(hardTimer); if (graceTimer) clearTimeout(graceTimer); resolveAll(); };
+        const hardTimer = setTimeout(finish, DEADLINE_MS);
+        if (pending === 0) return finish();
+        embeds.forEach((e) => {
+            resolveByServer(e.servername, e.embedUrl, ctx)
+                .then((r) => {
+                    if (r && !ctx.cancelled) {
+                        streams.push(buildStream(e, r));
+                        if (!graceTimer) graceTimer = setTimeout(finish, GRACE_MS);
+                    }
+                })
+                .catch((err) => console.log(`[${e.servername}] Error resolviendo:`, err.message))
+                .finally(() => { if (--pending === 0) finish(); });
+        });
+    });
+    ctx.cancelled = true;   // los que sigan en la cola del navegador se saltan
+
     console.log(`[${Date.now() - t0}ms] Streams resueltos: ${streams.length} (tiempo total de esta respuesta)`);
     return streams;
 }
