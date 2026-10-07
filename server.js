@@ -489,10 +489,17 @@ function releaseBrowserSlot() {
 }
 async function resolveViaBrowser(embedUrl, timeoutMs, ctx, priority) {
     if (ctx && ctx.cancelled) return null;
+    const tq = Date.now();
     await acquireBrowserSlot(priority);
+    const tStart = Date.now();
     try {
-        if (ctx && ctx.cancelled) return null;
-        return await resolveViaBrowserImpl(embedUrl, timeoutMs);
+        if (ctx && ctx.cancelled) { console.log(`[Browser] saltado (el pedido ya respondió) ${embedUrl}`); return null; }
+        const out = await resolveViaBrowserImpl(embedUrl, timeoutMs);
+        console.log(`[Browser] ${embedUrl} -> ${out ? 'OK' : 'null'} | esperó cola ${tStart - tq}ms, navegó ${Date.now() - tStart}ms`);
+        return out;
+    } catch (err) {
+        console.log(`[Browser] ${embedUrl} EXCEPCIÓN tras ${Date.now() - tStart}ms: ${err.message}`);
+        throw err;
     } finally {
         releaseBrowserSlot();
     }
@@ -786,8 +793,14 @@ async function resolveStreamsFor(type, id) {
         if (VIDHIDE_DIRECT && e.servername === 'vidhide' && /\.m3u8(\?|#|$)/i.test(r.url) && r.headers) {
             // Modo directo: Render no toca el playlist (axios desde Render se cuelga
             // contra morencius); el cliente lo pide con Referer/Origin/UA.
+            // Headers como los manda el navegador en el trace de morencius: Referer = página
+            // del embed y User-Agent, SIN Origin (las peticiones del reproductor no lo llevan).
+            // Los segmentos (.image en tiktokcdn) son públicos y no necesitan nada especial.
             stream.url = r.url;
-            stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: { ...r.headers } } };
+            stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: {
+                'Referer': r.headers.Referer,
+                'User-Agent': r.headers['User-Agent'] || PS_UA
+            } } };
         } else if (/\.txt(\?|#|$)/i.test(r.url) && r.headers) {
             stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: { ...r.headers } } };
         }
@@ -857,6 +870,71 @@ app.get('/debug/resolve', async (req, res) => {
         log.push(`EXCEPCIÓN: ${e.message}\n${e.stack}`);
     }
     res.send(log.join('\n'));
+});
+
+// Diagnóstico de vidhide desde Render: resuelve el embed con el navegador y luego
+// prueba, con axios (como lo haría el proxy), master -> playlist -> primer segmento.
+// Uso: /debug/vidhide?url=https://morencius.com/embed/XXXX
+app.get('/debug/vidhide', async (req, res) => {
+    const embed = req.query.url;
+    if (!embed) return res.status(400).send('Uso: /debug/vidhide?url=<embed de morencius u otro vidhide>');
+    res.set('Content-Type', 'text/plain');
+    const out = [];
+    const t0 = Date.now();
+    const p = (m) => out.push(`[${Date.now() - t0}ms] ${m}`);
+    try {
+        p('Resolviendo con navegador...');
+        const r = await resolveViaBrowser(embed, 40000, null, true);
+        if (!r) { p('El navegador devolvió null.'); return res.send(out.join('\n')); }
+        p(`URL: ${r.url}`);
+        p(`Headers: ${JSON.stringify(r.headers)}`);
+        const hdrs = Object.entries(r.headers).map(([k, v]) => `-H '${k}: ${v}'`).join(' ');
+        p(`Para probar desde TU red (si esto da 200 en tu PC pero 403 aquí, el token está atado a IP):\n    curl -i ${hdrs} '${r.url}'`);
+
+        const get = async (label, url, agent, extra) => {
+            const t = Date.now();
+            try {
+                const cfg = { headers: { ...r.headers, ...(extra || {}) }, timeout: 10000, responseType: 'text',
+                              transformResponse: [(d) => d], validateStatus: () => true };
+                if (agent) cfg.httpsAgent = agent;
+                const x = await axios.get(url, cfg);
+                p(`${label}: status ${x.status} en ${Date.now() - t}ms | content-type=${x.headers['content-type']} | ${String(x.data).slice(0, 160).replace(/\n/g, ' ⏎ ')}`);
+                return x;
+            } catch (e) {
+                p(`${label}: FALLÓ tras ${Date.now() - t}ms | ${e.code || ''} ${e.message}`);
+                return null;
+            }
+        };
+        let master = await get('MASTER (IPv4)', r.url, ipv4Agent);
+        const master2 = await get('MASTER (default)', r.url, undefined);
+        master = master || master2;
+        const firstLine = (txt) => String(txt || '').split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#'));
+        if (master && master.status === 200) {
+            const variantRel = firstLine(master.data);
+            if (variantRel) {
+                const variantUrl = new URL(variantRel, r.url).toString();
+                p(`Variante: ${variantUrl}`);
+                const v = await get('VARIANTE', variantUrl, ipv4Agent);
+                if (v && v.status === 200) {
+                    const segRel = firstLine(v.data);
+                    if (segRel) {
+                        const segUrl = new URL(segRel, variantUrl).toString();
+                        p(`Primer segmento: ${segUrl}`);
+                        const t = Date.now();
+                        try {
+                            const sg = await axios.get(segUrl, { headers: { ...r.headers, Range: 'bytes=0-1023' }, timeout: 10000,
+                                responseType: 'stream', validateStatus: () => true, httpsAgent: ipv4Agent });
+                            p(`SEGMENTO: status ${sg.status} en ${Date.now() - t}ms | content-type=${sg.headers['content-type']} | cors=${sg.headers['access-control-allow-origin'] || '(ninguno)'}`);
+                            sg.data.destroy();
+                        } catch (e) { p(`SEGMENTO: FALLÓ tras ${Date.now() - t}ms | ${e.code || ''} ${e.message}`); }
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        p(`EXCEPCIÓN: ${e.message}`);
+    }
+    res.send(out.join('\n'));
 });
 
 app.get('/debug/embeds', async (req, res) => {
