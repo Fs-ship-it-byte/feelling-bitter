@@ -127,9 +127,6 @@ const HLS_KEY_PREFERENCE = ['hls4', 'hls3', 'hls2'];
 const HLS_LIKE = /\.(?:m3u8|txt)(?:\?|#|$)/i;
 const HTTP_ATTEMPT_MS = parseInt(process.env.HTTP_ATTEMPT_MS || '8000', 10);   // tope por intento
 const HEDGE_DELAY_MS = parseInt(process.env.HEDGE_DELAY_MS || '3000', 10);     // cuánto esperar antes de lanzar el siguiente perfil
-// hglink.to es solo una página "Loading..." cuyo main.js redirige a vibuxer/hanerix/audinifer
-// con el MISMO id (/e/<id>). Como axios no ejecuta JS, vamos directo a esos dominios.
-const STREAMWISH_MIRRORS = (process.env.STREAMWISH_MIRRORS || 'vibuxer.com,hanerix.com,audinifer.com').split(',').map((x) => x.trim()).filter(Boolean);
 const VIDHIDE_MIRRORS = (process.env.VIDHIDE_MIRRORS || 'callistanise.com').split(',').map((x) => x.trim()).filter(Boolean);
 const STREAMWISH_HOSTS = ['streamwish', 'hglink', 'hgplaycdn', 'swdyu', 'cybervynx', 'dumbalag', 'niramirus', 'embedwish', 'wishfast', 'strwish', 'awish', 'flaswish', 'embedrise', 'kerapoxy', 'vibuxer', 'audinifer', 'hanerix', 'medixiru'];
 const VIDHIDE_HOSTS = ['vidhide', 'vidhidepro', 'vidhideplus', 'mivalyo', 'dinisglows', 'dhtpre', 'filelions', 'callistanise', 'morencius', 'earnvids'];
@@ -295,26 +292,6 @@ function resolveViaHttp(embedUrl) {
                 if (host.includes(mirror)) continue;
                 attempts.push({ name: 'mirror:' + mirror, url: `https://${mirror}/embed/${id}`, profile: 'ld', referer: 'https://filelions.to/', delay: HEDGE_DELAY_MS });
             }
-        }
-    }
-
-    if (familyOf(embedUrl) === 'streamwish') {
-        let host = '', id = null;
-        try {
-            const u = new URL(embedUrl);
-            host = u.hostname;
-            const m = u.pathname.match(/\/(?:embed|e|v)\/([A-Za-z0-9]+)/);
-            if (m) id = m[1];
-        } catch (e) { /* noop */ }
-        if (id) {
-            const stub = host.includes('hglink');
-            const mirrors = STREAMWISH_MIRRORS.filter((mh) => !host.includes(mh.split('.')[0]));
-            // si el embed es el stub, la página original no sirve: se salta y se va directo a los espejos
-            const base = attempts.splice(0, attempts.length);
-            if (!stub) attempts.push(...base);
-            mirrors.forEach((mh, i) => {
-                attempts.push({ name: 'mirror:' + mh, url: `https://${mh}/e/${id}`, profile: 'ld', referer: stub ? `https://${host}/` : 'https://www.google.com/', delay: (stub ? 0 : HEDGE_DELAY_MS) + i * 1500 });
-            });
         }
     }
 
