@@ -289,16 +289,27 @@ let puppeteer = null;
 try { puppeteer = require('puppeteer'); } catch (e) { /* opcional */ }
 
 let _browserInstance = null;
+let _browserLaunching = null;   // promesa compartida: evita lanzar 2 Chromium si llegan 2 pedidos a la vez
 async function getBrowser() {
     if (!puppeteer) throw new Error('puppeteer no está instalado');
     if (_browserInstance && _browserInstance.isConnected()) return _browserInstance;
+    if (_browserLaunching) return _browserLaunching;
     const launchOpts = {
         headless: 'new',
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
     };
     if (process.env.PUPPETEER_EXECUTABLE_PATH) launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    _browserInstance = await puppeteer.launch(launchOpts);
-    return _browserInstance;
+    _browserLaunching = (async () => {
+        try {
+            const b = await puppeteer.launch(launchOpts);
+            _browserInstance = b;
+            b.on('disconnected', () => { if (_browserInstance === b) _browserInstance = null; });
+            return b;
+        } finally {
+            _browserLaunching = null;
+        }
+    })();
+    return _browserLaunching;
 }
 
 async function resolveViaBrowserImpl(embedUrl, timeoutMs) {
@@ -388,9 +399,23 @@ async function resolveViaBrowserImpl(embedUrl, timeoutMs) {
             if (frame === page.mainFrame()) lastReferer = frame.url();
         });
 
-        try {
-            await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: timeoutMs, referer: 'https://www.google.com/' });
-        } catch (e) { /* seguimos igual, puede que ya haya resuelto durante la navegación */ }
+        // Antes se esperaba al domcontentloaded (o a los 30s de timeout) aunque el master
+        // ya se hubiera pedido a los pocos segundos. Ahora se corre la navegación contra
+        // "ya tengo el master": lo que ocurra primero.
+        const tNav = Date.now();
+        const gotoP = page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: timeoutMs, referer: 'https://www.google.com/' })
+            .catch(() => { /* seguimos igual, puede que ya haya resuelto durante la navegación */ });
+        await Promise.race([
+            gotoP,
+            new Promise((res) => {
+                const iv = setInterval(() => { if (resolved) { clearInterval(iv); res(); } }, 150);
+                gotoP.then(() => { clearInterval(iv); res(); });
+            })
+        ]);
+        if (resolved) {
+            console.log(`[Browser] master capturado a los ${Date.now() - tNav}ms, sin esperar a que cargue la página`);
+            return resolved;
+        }
 
         try {
             const title = await page.title();
@@ -809,8 +834,8 @@ async function resolveStreamsFor(type, id) {
 
     // Tope total y salida anticipada: no esperamos al Puppeteer lento si ya hay
     // algo que mostrar. Stremio se rinde pronto; mejor 1-2 streams a tiempo.
-    const DEADLINE_MS = parseInt(process.env.RESOLVE_DEADLINE_MS || '50000', 10);
-    const GRACE_MS = parseInt(process.env.RESOLVE_GRACE_MS || '20000', 10);
+    const DEADLINE_MS = parseInt(process.env.RESOLVE_DEADLINE_MS || '35000', 10);
+    const GRACE_MS = parseInt(process.env.RESOLVE_GRACE_MS || '10000', 10);
     await new Promise((resolveAll) => {
         let pending = embeds.length;
         let graceTimer = null;
