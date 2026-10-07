@@ -666,16 +666,19 @@ function rewriteM3u8(playlistText, baseUrl, headers, full) {
 async function handleHlsPlaylistProxy(req, res) {
     const data = decodeProxyToken(req.params.token);
     if (!data) return res.status(400).send('Token inválido');
+    const tp0 = Date.now();
     try {
         const upstream = await axios.get(data.url, {
             headers: data.headers, timeout: 15000, responseType: 'text',
-            transformResponse: [(d) => d]
+            transformResponse: [(d) => d], httpsAgent: ipv4Agent
         });
         const rewritten = rewriteM3u8(upstream.data, data.url, data.headers, data.full);
         res.set('Access-Control-Allow-Origin', '*');
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewritten);
     } catch (e) {
+        let host = '?'; try { host = new URL(data.url).host; } catch (_) {}
+        console.log(`[Proxy] playlist FALLÓ tras ${Date.now() - tp0}ms | host=${host} | status=${e.response ? e.response.status : 'sin respuesta'} | ${e.code || ''} ${e.message}`);
         res.status(502).send('No se pudo obtener el playlist: ' + e.message);
     }
 }
@@ -700,6 +703,8 @@ async function handleHlsSegmentProxy(req, res) {
 // directo al CDN y los headers los intenta mandar el cliente (ver proxyHeaders
 // más abajo).
 const PROXY_TXT = process.env.PROXY_TXT === '1';
+// VIDHIDE_DIRECT=0 para volver al comportamiento anterior (playlist por Render).
+const VIDHIDE_DIRECT = process.env.VIDHIDE_DIRECT !== '0';
 function buildProxyPlaylistUrl(targetUrl, headers) {
     const full = PROXY_TXT && /\.txt(\?|#|$)/i.test(targetUrl);
     const token = encodeProxyToken(targetUrl, headers, full);
@@ -778,7 +783,12 @@ async function resolveStreamsFor(type, id) {
         // Masters .txt (CDN de StreamWish en Cloudflare, CORS atado al origen del
         // embed): le pedimos a Stremio que mande Referer/Origin/UA desde el
         // cliente, sin pasar bytes por nuestro server.
-        if (/\.txt(\?|#|$)/i.test(r.url) && r.headers) {
+        if (VIDHIDE_DIRECT && e.servername === 'vidhide' && /\.m3u8(\?|#|$)/i.test(r.url) && r.headers) {
+            // Modo directo: Render no toca el playlist (axios desde Render se cuelga
+            // contra morencius); el cliente lo pide con Referer/Origin/UA.
+            stream.url = r.url;
+            stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: { ...r.headers } } };
+        } else if (/\.txt(\?|#|$)/i.test(r.url) && r.headers) {
             stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: { ...r.headers } } };
         }
         return stream;
