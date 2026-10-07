@@ -1,7 +1,6 @@
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
-const https = require('https');
 
 const app = express();
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://127.0.0.1:${process.env.PORT || 7000}`).replace(/\/+$/, '');
@@ -45,17 +44,15 @@ async function getDecryptedEmbeds(imdbId, season, episode) {
     const url = buildVidUrl(imdbId, season, episode);
     const resp = await axios.get(url, {
         headers: { 'User-Agent': PS_UA, 'Referer': BASE + '/' },
-        timeout: 12000,
-        responseType: 'text',
-        transformResponse: [(d) => d]
+        timeout: 12000, responseType: 'text', transformResponse: [(d) => d],
+        validateStatus: (s) => s < 500
     });
-    let html = resp.data;
-    if (Buffer.isBuffer(html)) html = html.toString('utf8');
-    if (typeof html !== 'string') {
-        // axios a veces entrega objeto/vacío (JSON, error del sitio): evita "html.match is not a function"
-        try { html = JSON.stringify(html); } catch (e) { html = ''; }
-        console.log(`[Embeds] Respuesta no-texto de ${url} (status ${resp.status}); sin embeds.`);
-        if (!html || html === 'null' || html === 'undefined') return [];
+    // Antes axios devolvía un objeto cuando el sitio contestaba JSON (episodio/serie
+    // que no existe, temporada 0...) y html.match reventaba con "html.match is not a function".
+    const html = typeof resp.data === 'string' ? resp.data : '';
+    if (!html) {
+        console.log(`vidurl sin HTML válido (status ${resp.status}) para ${imdbId} ${season || ''}:${episode || ''}`);
+        return [];
     }
 
     const challengeMatch = html.match(/POW_CHALLENGE\s*=\s*'([^']+)'/);
@@ -106,138 +103,237 @@ function unpackEvalPacker(script) {
     });
 }
 
-// El embed trae varios links (hls2 = CDN firmado con asn atado a la red que
-// pidió el embed; hls4 = /stream/... en el propio dominio del embed, el que usa
-// el reproductor en el navegador y cuyos segmentos son públicos). Antes se
-// tomaba el PRIMERO que apareciera, y el orden cambia entre pedidos. Ahora
-// se prefiere hls4 y hls2 queda solo como respaldo.
-const VIDHIDE_QUICK_TIMEOUT = parseInt(process.env.VIDHIDE_QUICK_TIMEOUT || '5000', 10);
-function pickVidHideHls(text) {
-    const isHls = (v) => typeof v === 'string' && /\.(?:m3u8|txt)(?:\?|#|$)/i.test(v);
-    for (const key of ['hls4', 'hls3', 'hls2']) {
-        const re = new RegExp('"' + key + '"\\s*:\\s*"([^"]+)"');
-        const m = text.match(re);
-        if (m) {
-            const v = m[1].replace(/\\\//g, '/');
-            if (isHls(v)) return v;
+// ==========================================================================
+// RESOLVER HTTP COMÚN PARA STREAMWISH / VIDHIDE (y sus dominios espejo)
+// Portado de laughing-dollop (src/extractors/streamhosts.js), sin dependencias nuevas.
+//
+// Por qué se cambió:
+//  - El resolver viejo de VidHide pedía el embed con SOLO User-Agent + un Referer
+//    igual al propio dominio (https://morencius.com/) y los defaults de axios
+//    (Accept: application/json...). Desde cierto momento esas peticiones se
+//    quedan colgadas (timeout 12s) aunque Chromium, desde la MISMA máquina, sí
+//    carga la página. O sea: no es la IP, es cómo se ve la petición.
+//    laughing-dollop pide con Accept/Accept-Language de navegador y Referer
+//    google, y ahí VidHide sí responde.
+//  - El resolver viejo de StreamWish solo buscaba "https://...m3u8" en el JS, pero
+//    ahora el embed trae {hls4:"/stream/...m3u8", hls3:"https://...txt", hls2:"..."}
+//    (hls4 relativo, hls3 .txt), por eso SIEMPRE caía a Chromium (~12-60 s y mucha RAM).
+//  - Preferencia de link: hls4 (segmentos públicos) > hls3 > hls2 (token atado al
+//    ASN de quien resolvió: en los logs aparece asn=7029, no sirve desde el celular).
+// ==========================================================================
+const HTTP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const EDGE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0';
+const HLS_KEY_PREFERENCE = ['hls4', 'hls3', 'hls2'];
+const HLS_LIKE = /\.(?:m3u8|txt)(?:\?|#|$)/i;
+const HTTP_ATTEMPT_MS = parseInt(process.env.HTTP_ATTEMPT_MS || '8000', 10);   // tope por intento
+const HEDGE_DELAY_MS = parseInt(process.env.HEDGE_DELAY_MS || '3000', 10);     // cuánto esperar antes de lanzar el siguiente perfil
+const VIDHIDE_MIRRORS = (process.env.VIDHIDE_MIRRORS || 'callistanise.com').split(',').map((x) => x.trim()).filter(Boolean);
+const STREAMWISH_HOSTS = ['streamwish', 'hglink', 'hgplaycdn', 'swdyu', 'cybervynx', 'dumbalag', 'niramirus', 'embedwish', 'wishfast', 'strwish', 'awish', 'flaswish', 'embedrise', 'kerapoxy', 'vibuxer', 'audinifer', 'hanerix', 'medixiru'];
+const VIDHIDE_HOSTS = ['vidhide', 'vidhidepro', 'vidhideplus', 'mivalyo', 'dinisglows', 'dhtpre', 'filelions', 'callistanise', 'morencius', 'earnvids'];
+
+// Perfiles de headers para pedir la PÁGINA del embed.
+//  ld     = el de laughing-dollop (probado: funciona con morencius)
+//  iframe = navegación de iframe de Edge 133, igual a la captura de la VM
+const HEADER_PROFILES = {
+    ld: (referer) => ({
+        'User-Agent': HTTP_UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+        'Referer': referer
+    }),
+    iframe: (referer) => ({
+        'User-Agent': EDGE_UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Upgrade-Insecure-Requests': '1',
+        'sec-ch-ua': '"Not(A:Brand";v="99", "Microsoft Edge";v="133", "Chromium";v="133"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'Sec-Fetch-Dest': 'iframe',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'cross-site',
+        'Referer': referer
+    })
+};
+
+function familyOf(url) {
+    let host;
+    try { host = new URL(url).hostname.toLowerCase(); } catch (e) { return null; }
+    if (STREAMWISH_HOSTS.some((h) => host.includes(h))) return 'streamwish';
+    if (VIDHIDE_HOSTS.some((h) => host.includes(h))) return 'vidhide';
+    return null;
+}
+
+// Desempaqueta TODOS los eval(function(p,a,c,k,e,d){...}) de la página.
+function baseEncode(n, a) {
+    const digits = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    return (n < a ? '' : baseEncode(Math.floor(n / a), a)) + digits[n % a];
+}
+function unpackAllEvalBlocks(html) {
+    const re = /eval\(\s*function\s*\(p,a,c,k,e,[rd]\)[\s\S]*?\}\s*\(\s*'([\s\S]*?)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'([\s\S]*?)'\s*\.split\('\|'\)/g;
+    let m, out = '';
+    while ((m = re.exec(html)) !== null) {
+        let p = m[1];
+        const a = parseInt(m[2], 10);
+        let c = parseInt(m[3], 10);
+        const k = m[4].split('|');
+        while (c--) {
+            if (k[c]) p = p.replace(new RegExp('\\b' + baseEncode(c, a) + '\\b', 'g'), k[c]);
         }
+        out += '\n' + p;
+    }
+    return out;
+}
+
+function pickPreferredHls(code, base) {
+    const found = {};
+    const re = /["']?\b(hls[234])["']?\s*:\s*["']([^"']+)["']/g;
+    let m;
+    while ((m = re.exec(code)) !== null) {
+        if (!found[m[1]]) found[m[1]] = m[2].replace(/\\\//g, '/');
+    }
+    for (const key of HLS_KEY_PREFERENCE) {
+        if (found[key] && HLS_LIKE.test(found[key])) return { url: makeAbsoluteUrl(found[key], base), key };
+    }
+    return null;
+}
+// Respaldo para páginas con formato viejo (file:"...m3u8" o URL suelta).
+function pickLegacyHls(code, base) {
+    const fm = code.match(/file\s*:\s*["']([^"']+\.(?:m3u8|txt)[^"']*?)["']/i);
+    if (fm) return { url: makeAbsoluteUrl(fm[1].replace(/\\\//g, '/'), base), key: 'file' };
+    const am = code.match(/(https?:\/\/[^"'\s\\]+\.m3u8[^"'\s\\]*)/i);
+    if (am) return { url: am[1], key: 'url' };
+    return null;
+}
+
+// Saltos client-side hacia un dominio "mutante" (streamwish.to/e/ID -> otro.com/e/ID).
+function findMutantRedirect(html, base) {
+    const patterns = [
+        /window\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i,
+        /location\.replace\s*\(\s*['"]([^'"]+)['"]\s*\)/i,
+        /<meta[^>]+http-equiv\s*=\s*['"]refresh['"][^>]+content\s*=\s*['"][^'">\s]+url=([^'">\s]+)/i,
+        /<iframe[^>]+src\s*=\s*['"]([^'"]+\/(?:e|embed)\/[a-zA-Z0-9]+[^'"]*)['"]/i
+    ];
+    for (const re of patterns) {
+        const m = html.match(re);
+        if (m && m[1]) return makeAbsoluteUrl(m[1], base);
     }
     return null;
 }
 
-// Baja el HTML del embed probando dos juegos de headers EN PARALELO (Referer de
-// PelisPedia, que es donde vive el player, y Referer del propio dominio). Gana
-// el primero que responda texto; tope corto para no quemar 12s antes del navegador.
-const ipv4Agent = new https.Agent({ family: 4, keepAlive: false });
-async function fetchEmbedHtml(url) {
-    const origin = new URL(url).origin;
-    const common = {
-        'User-Agent': PS_UA,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
-    };
-    // Un timeout "a secas" (sin status) apunta a conexión colgada, no a un 403:
-    // por eso una variante fuerza IPv4 (Render a veces intenta IPv6 sin salida).
-    const variants = [
-        { headers: { ...common, 'Referer': BASE + '/' }, agent: ipv4Agent },
-        { headers: { ...common, 'Referer': origin + '/' }, agent: ipv4Agent },
-        { headers: { ...common, 'Referer': BASE + '/' }, agent: undefined }
-    ];
-    const tryOne = async (v) => {
-        const cfg = {
-            headers: v.headers, timeout: VIDHIDE_QUICK_TIMEOUT, responseType: 'text',
-            transformResponse: [(d) => d], maxRedirects: 5
-        };
-        if (v.agent) cfg.httpsAgent = v.agent;
-        const r = await axios.get(url, cfg);
-        if (typeof r.data !== 'string' || r.data.length < 200) throw new Error('respuesta vacía o no-texto');
-        return r.data;
-    };
-    return Promise.any(variants.map(tryOne)).catch((agg) => {
-        throw (agg && agg.errors && agg.errors[0]) || agg;
+// Headers con los que el navegador pediría el master (lo que mandamos al CDN
+// y, vía token del proxy liviano, lo que usa nuestro server para bajar playlists):
+// Origin = origen de la PÁGINA del embed; Referer = la página si el master es del
+// mismo origen, o su origen + "/" si es cross-origin (así se ve en la captura).
+function browserLikeHeaders(masterUrl, pageUrl, ua) {
+    const h = { 'User-Agent': ua };
+    try {
+        const po = new URL(pageUrl).origin;
+        const mo = new URL(masterUrl).origin;
+        h.Referer = mo === po ? pageUrl.split('#')[0] : po + '/';
+        h.Origin = po;
+    } catch (e) { h.Referer = pageUrl; }
+    return h;
+}
+
+async function fetchPage(url, headers, ms, signal) {
+    const r = await axios.get(url, {
+        headers, timeout: ms, signal, responseType: 'text', transformResponse: [(d) => d],
+        maxRedirects: 5, validateStatus: (s) => s >= 200 && s < 400
     });
+    const finalUrl = (r.request && r.request.res && r.request.res.responseUrl) || url;
+    return { html: typeof r.data === 'string' ? r.data : '', finalUrl };
 }
 
-let _vhQuickFails = 0;
-let _vhSkipQuickUntil = 0;
-async function resolveVidHide(url) {
-    try {
-        const domain = new URL(url).hostname;
-        if (Date.now() < _vhSkipQuickUntil) return null;   // el rápido viene fallando: directo al navegador
-        let html;
+// Un intento completo (con hasta 4 saltos de redirección client-side) con un perfil de headers.
+async function httpAttempt(startUrl, profile, firstReferer, signal, ms) {
+    const mk = HEADER_PROFILES[profile];
+    const visited = new Set();
+    let currentUrl = startUrl;
+    let referer = firstReferer;
+    for (let hop = 0; hop < 4; hop++) {
+        if (visited.has(currentUrl)) break;
+        visited.add(currentUrl);
+        const headers = mk(referer);
+        const { html, finalUrl } = await fetchPage(currentUrl, headers, ms, signal);
+        visited.add(finalUrl);
+        const origin = new URL(finalUrl).origin;
+        const code = `${unpackAllEvalBlocks(html)}\n${html}`;
+        const picked = pickPreferredHls(code, origin) || pickLegacyHls(code, origin);
+        if (picked) return { url: picked.url, key: picked.key, headers: browserLikeHeaders(picked.url, finalUrl, headers['User-Agent']) };
+        const next = findMutantRedirect(html, origin);
+        if (!next || visited.has(next)) return null;
+        currentUrl = next;
+        referer = origin + '/';
+    }
+    return null;
+}
+
+// Camino HTTP con "hedging": arranca con el perfil de laughing-dollop; si en
+// HEDGE_DELAY_MS no hubo respuesta, lanza en paralelo el perfil de navegador real
+// (Edge 133) y, para VidHide, el mismo archivo en un dominio espejo. Gana el primero
+// que devuelve link; los demás se cancelan. Tope duro: HTTP_ATTEMPT_MS por intento.
+function resolveViaHttp(embedUrl) {
+    const attempts = [
+        { name: 'ld', url: embedUrl, profile: 'ld', referer: 'https://www.google.com/', delay: 0 },
+        { name: 'iframe', url: embedUrl, profile: 'iframe', referer: BASE + '/', delay: HEDGE_DELAY_MS }
+    ];
+    if (familyOf(embedUrl) === 'vidhide') {
+        let host = '', id = null;
         try {
-            html = await fetchEmbedHtml(url);
-            _vhQuickFails = 0;
-        } catch (err) {
-            if (++_vhQuickFails >= 3) {
-                _vhSkipQuickUntil = Date.now() + 10 * 60 * 1000;
-                _vhQuickFails = 0;
-                console.log('[VidHide] El método rápido falló 3 veces seguidas: lo salto por 10 min y voy directo al navegador.');
-            }
-            throw err;
-        }
-        let finalUrl = null;
-
-        const packedMatch = html.match(/eval\(function\(p,a,c,k,e,[rd]\)[\s\S]*?\.split\('\|'\)[^)]*\)\)/);
-        if (packedMatch) {
-            const unpacked = unpackEvalPacker(packedMatch[0]);
-            if (unpacked) {
-                const picked = pickVidHideHls(unpacked);
-                if (picked) finalUrl = picked;
+            const u = new URL(embedUrl);
+            host = u.hostname;
+            const m = u.pathname.match(/\/(?:embed|e|v)\/([A-Za-z0-9]+)/);
+            if (m) id = m[1];
+        } catch (e) { /* noop */ }
+        if (id) {
+            for (const mirror of VIDHIDE_MIRRORS) {
+                if (host.includes(mirror)) continue;
+                attempts.push({ name: 'mirror:' + mirror, url: `https://${mirror}/embed/${id}`, profile: 'ld', referer: 'https://filelions.to/', delay: HEDGE_DELAY_MS });
             }
         }
-        if (!finalUrl) {
-            const rawPicked = pickVidHideHls(html);
-            if (rawPicked) finalUrl = rawPicked;
-            else {
-                const fileMatch = html.match(/file\s*:\s*["']([^"']+)["']/i);
-                if (fileMatch) finalUrl = fileMatch[1];
-            }
-        }
-        if (!finalUrl) return null;
-        if (!finalUrl.startsWith('http')) finalUrl = new URL(url).origin + finalUrl;
-
-        return {
-            url: finalUrl,
-            headers: { Referer: url.split('?')[0], Origin: new URL(url).origin, 'User-Agent': PS_UA }
-        };
-    } catch (e) {
-        console.log('[VidHide] Error:', e.message);
-        return null;
     }
-}
 
-async function resolveStreamWish(url) {
-    try {
-        const resp = await axios.get(url, {
-            headers: { 'User-Agent': PS_UA, 'Referer': url },
-            timeout: 12000
-        });
-        const html = resp.data;
-        let m3u8Url = null;
-
-        const packedMatch = html.match(/eval\(function\(p,a,c,k,e,[a-z]\)\{[\s\S]*?\}\s*\('([\s\S]+?)',\s*(\d+),\s*(\d+),\s*'([\s\S]+?)'\.split\('\|'\)/);
-        if (packedMatch) {
-            const unpacked = unpackEvalPacker(packedMatch[0]);
-            if (unpacked) {
-                const match = unpacked.match(/https?:\/\/[^"'\s]+\.m3u8[^"'\s]*/);
-                if (match) m3u8Url = match[0];
-            }
-        }
-        if (!m3u8Url) {
-            const fileMatch = html.match(/file\s*:\s*["']([^"']+)["']/i);
-            if (fileMatch) m3u8Url = fileMatch[1];
-        }
-        if (!m3u8Url) return null;
-
-        return {
-            url: m3u8Url,
-            headers: { Referer: url, Origin: new URL(url).origin, 'User-Agent': PS_UA }
+    return new Promise((resolve) => {
+        const t0 = Date.now();
+        const timers = [];
+        const ctrls = [];
+        let pending = attempts.length;
+        let settled = false;
+        const settle = (v) => {
+            if (settled) return;
+            settled = true;
+            timers.forEach(clearTimeout);
+            ctrls.forEach((c) => { try { c.abort(); } catch (e) { /* noop */ } });
+            resolve(v);
         };
-    } catch (e) {
-        console.log('[StreamWish] Error:', e.message);
-        return null;
-    }
+        for (const a of attempts) {
+            timers.push(setTimeout(async () => {
+                if (settled) return;
+                const ac = new AbortController();
+                ctrls.push(ac);
+                const kill = setTimeout(() => ac.abort(), HTTP_ATTEMPT_MS);
+                try {
+                    const r = await httpAttempt(a.url, a.profile, a.referer, ac.signal, HTTP_ATTEMPT_MS);
+                    if (r) {
+                        console.log(`[http:${a.name}] OK en ${Date.now() - t0}ms [${r.key}] ${embedUrl}`);
+                        settle({ url: r.url, headers: r.headers, via: 'http:' + a.name });
+                        return;
+                    }
+                    if (!settled) console.log(`[http:${a.name}] la página no trae link (${Date.now() - t0}ms) ${a.url}`);
+                } catch (e) {
+                    if (!settled) {
+                        const why = (e.code === 'ERR_CANCELED' || /canceled|timeout/i.test(e.message || '')) ? `sin respuesta en ${HTTP_ATTEMPT_MS}ms` : e.message;
+                        console.log(`[http:${a.name}] falló (${Date.now() - t0}ms): ${why} -- ${a.url}`);
+                    }
+                } finally {
+                    clearTimeout(kill);
+                    if (--pending === 0) settle(null);
+                }
+            }, a.delay));
+        }
+    });
 }
 
 function localAtob(input) {
@@ -289,31 +385,21 @@ let puppeteer = null;
 try { puppeteer = require('puppeteer'); } catch (e) { /* opcional */ }
 
 let _browserInstance = null;
-let _browserLaunching = null;   // promesa compartida: evita lanzar 2 Chromium si llegan 2 pedidos a la vez
 async function getBrowser() {
     if (!puppeteer) throw new Error('puppeteer no está instalado');
     if (_browserInstance && _browserInstance.isConnected()) return _browserInstance;
-    if (_browserLaunching) return _browserLaunching;
     const launchOpts = {
         headless: 'new',
+        protocolTimeout: 30000, // sin esto un Chromium colgado bloqueaba minutos
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
     };
     if (process.env.PUPPETEER_EXECUTABLE_PATH) launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    _browserLaunching = (async () => {
-        try {
-            const b = await puppeteer.launch(launchOpts);
-            _browserInstance = b;
-            b.on('disconnected', () => { if (_browserInstance === b) _browserInstance = null; });
-            return b;
-        } finally {
-            _browserLaunching = null;
-        }
-    })();
-    return _browserLaunching;
+    _browserInstance = await puppeteer.launch(launchOpts);
+    return _browserInstance;
 }
 
-async function resolveViaBrowserImpl(embedUrl, timeoutMs) {
-    timeoutMs = timeoutMs || 30000;
+async function resolveViaBrowserInner(embedUrl, timeoutMs) {
+    timeoutMs = timeoutMs || BROWSER_TIMEOUT_MS;
     if (!puppeteer) return null;
 
     let browser, page, onTargetCreated;
@@ -399,23 +485,9 @@ async function resolveViaBrowserImpl(embedUrl, timeoutMs) {
             if (frame === page.mainFrame()) lastReferer = frame.url();
         });
 
-        // Antes se esperaba al domcontentloaded (o a los 30s de timeout) aunque el master
-        // ya se hubiera pedido a los pocos segundos. Ahora se corre la navegación contra
-        // "ya tengo el master": lo que ocurra primero.
-        const tNav = Date.now();
-        const gotoP = page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: timeoutMs, referer: 'https://www.google.com/' })
-            .catch(() => { /* seguimos igual, puede que ya haya resuelto durante la navegación */ });
-        await Promise.race([
-            gotoP,
-            new Promise((res) => {
-                const iv = setInterval(() => { if (resolved) { clearInterval(iv); res(); } }, 150);
-                gotoP.then(() => { clearInterval(iv); res(); });
-            })
-        ]);
-        if (resolved) {
-            console.log(`[Browser] master capturado a los ${Date.now() - tNav}ms, sin esperar a que cargue la página`);
-            return resolved;
-        }
+        try {
+            await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: timeoutMs, referer: 'https://www.google.com/' });
+        } catch (e) { /* seguimos igual, puede que ya haya resuelto durante la navegación */ }
 
         try {
             const title = await page.title();
@@ -490,6 +562,14 @@ async function resolveViaBrowserImpl(embedUrl, timeoutMs) {
         return resolved;
     } catch (e) {
         console.log('[Puppeteer] Error:', e.message);
+        if (/timed out|Target closed|Connection closed|Protocol error|Failed to launch|Could not find/i.test(e.message || '')) {
+            try { if (_browserInstance) await _browserInstance.close(); } catch (_e) { /* noop */ }
+            _browserInstance = null;
+            if (/Failed to launch|Could not find|WS endpoint/i.test(e.message || '')) {
+                _brokenUntil = Date.now() + 5 * 60 * 1000;
+                console.log('[Puppeteer] Chromium no arranca (¿poca RAM?), se desactiva el camino con navegador por 5 min');
+            }
+        }
         return null;
     } finally {
         if (browser && onTargetCreated) { try { browser.off('targetcreated', onTargetCreated); } catch (e) {} }
@@ -497,65 +577,72 @@ async function resolveViaBrowserImpl(embedUrl, timeoutMs) {
     }
 }
 
-// Cola: un solo Chromium trabajando a la vez (configurable). En Render los
-// lanzamientos simultáneos agotan memoria ("WS endpoint" timeout) y todo se
-// vuelve más lento. Si el pedido ya respondió (ctx.cancelled), se salta.
-const BROWSER_CONCURRENCY = parseInt(process.env.BROWSER_CONCURRENCY || '2', 10);
-let _browserActive = 0;
-const _browserWaiters = [];
-async function acquireBrowserSlot(priority) {
-    if (_browserActive < BROWSER_CONCURRENCY) { _browserActive++; return; }
-    await new Promise((resolve) => { priority ? _browserWaiters.unshift(resolve) : _browserWaiters.push(resolve); });
-}
-function releaseBrowserSlot() {
-    const next = _browserWaiters.shift();
-    if (next) next();           // el slot pasa directo al siguiente
-    else _browserActive--;
-}
-async function resolveViaBrowser(embedUrl, timeoutMs, ctx, priority) {
-    if (ctx && ctx.cancelled) return null;
-    const tq = Date.now();
-    await acquireBrowserSlot(priority);
-    const tStart = Date.now();
-    try {
-        if (ctx && ctx.cancelled) { console.log(`[Browser] saltado (el pedido ya respondió) ${embedUrl}`); return null; }
-        const out = await resolveViaBrowserImpl(embedUrl, timeoutMs);
-        console.log(`[Browser] ${embedUrl} -> ${out ? 'OK' : 'null'} | esperó cola ${tStart - tq}ms, navegó ${Date.now() - tStart}ms`);
-        return out;
-    } catch (err) {
-        console.log(`[Browser] ${embedUrl} EXCEPCIÓN tras ${Date.now() - tStart}ms: ${err.message}`);
-        throw err;
-    } finally {
-        releaseBrowserSlot();
+// Chromium: UNA página a la vez y máximo BROWSER_QUEUE_MAX en cola. Antes un solo
+// pedido de película abría hasta 6 páginas a la vez (3 streamwish + 3 vidhide); en
+// una instancia chica de Render eso agota la RAM (en el log: "Timed out after 30000 ms
+// while waiting for the WS endpoint" y el server reiniciándose una y otra vez).
+const BROWSER_TIMEOUT_MS = parseInt(process.env.BROWSER_TIMEOUT_MS || '20000', 10);
+const BROWSER_QUEUE_MAX = parseInt(process.env.BROWSER_QUEUE_MAX || '2', 10);
+let _brokenUntil = 0;
+let _bq = Promise.resolve();
+let _bPending = 0;
+function resolveViaBrowser(embedUrl, timeoutMs) {
+    if (!puppeteer) return Promise.resolve(null);
+    if (Date.now() < _brokenUntil) return Promise.resolve(null);
+    if (_bPending >= BROWSER_QUEUE_MAX) {
+        console.log(`[Puppeteer] cola llena (${_bPending}), se omite: ${embedUrl}`);
+        return Promise.resolve(null);
     }
+    _bPending++;
+    const run = _bq.then(() => resolveViaBrowserInner(embedUrl, timeoutMs), () => resolveViaBrowserInner(embedUrl, timeoutMs));
+    _bq = run.then(() => undefined, () => undefined);
+    return run.finally(() => { _bPending--; });
 }
 
-async function resolveByServer(servername, embedUrl, ctx) {
+async function resolveByServerRaw(servername, embedUrl) {
     const name = (servername || '').toLowerCase();
 
-    if (name === 'vidhide') {
-        const quick = await resolveVidHide(embedUrl);
-        if (quick) return quick;
-        return resolveViaBrowser(embedUrl, undefined, ctx, true);
-    }
-
-    if (name === 'streamwish') {
-        const quick = await resolveStreamWish(embedUrl);
-        if (quick) return quick;
-        console.log('[StreamWish] Método rápido no encontró nada, probando con navegador...');
-        return resolveViaBrowser(embedUrl, undefined, ctx);
-    }
-
     if (name === 'voe') {
-        // VOE deshabilitado: el checkbox de Altcha nunca terminaba de
-        // resolverse, así que todos los pedidos quemaban el timeout
-        // completo de Puppeteer (~30s) en vano -- la fuente principal del
-        // consumo excesivo. Con vidhide y streamwish alcanza.
+        // VOE deshabilitado: el checkbox de Altcha nunca terminaba de resolverse y
+        // quemaba el timeout completo de Puppeteer en vano.
+        return null;
+    }
+    if (name !== 'vidhide' && name !== 'streamwish') {
+        console.log(`[Resolvers] Servidor sin resolver implementado: ${servername}`);
         return null;
     }
 
-    console.log(`[Resolvers] Servidor sin resolver implementado: ${servername}`);
-    return null;
+    const t0 = Date.now();
+    const quick = await resolveViaHttp(embedUrl);
+    if (quick) return quick;
+    console.log(`[${name}] HTTP no encontró nada (${Date.now() - t0}ms), probando con navegador: ${embedUrl}`);
+    return resolveViaBrowser(embedUrl);
+}
+
+// Caché + dedupe por embed. Los tokens duran horas, así que un resultado bueno se
+// reutiliza 10 min; uno vacío 60 s (evita relanzar todo en cada reintento de Stremio).
+// Si la respuesta a Stremio ya salió por el tope de tiempo, la resolución sigue en
+// segundo plano y queda guardada para el reintento.
+const POS_TTL_MS = 10 * 60 * 1000;
+const NEG_TTL_MS = 60 * 1000;
+const embedCache = new Map();
+function resolveByServer(servername, embedUrl) {
+    const key = `${(servername || '').toLowerCase()}|${embedUrl}`;
+    const hit = embedCache.get(key);
+    if (hit) {
+        if (!hit.settled) return hit.p;
+        if (Date.now() - hit.t < (hit.value ? POS_TTL_MS : NEG_TTL_MS)) return Promise.resolve(hit.value);
+    }
+    if (embedCache.size > 300) {
+        for (const [k, v] of embedCache) { if (v.settled && Date.now() - v.t > POS_TTL_MS) embedCache.delete(k); }
+        if (embedCache.size > 300) embedCache.clear();
+    }
+    const entry = { settled: false, value: null, t: Date.now() };
+    entry.p = resolveByServerRaw(servername, embedUrl)
+        .catch((e) => { console.log('[Resolvers] error:', e.message); return null; })
+        .then((v) => { entry.settled = true; entry.value = v; entry.t = Date.now(); return v; });
+    embedCache.set(key, entry);
+    return entry.p;
 }
 
 function encodeProxyToken(url, headers, full) {
@@ -698,19 +785,16 @@ function rewriteM3u8(playlistText, baseUrl, headers, full) {
 async function handleHlsPlaylistProxy(req, res) {
     const data = decodeProxyToken(req.params.token);
     if (!data) return res.status(400).send('Token inválido');
-    const tp0 = Date.now();
     try {
         const upstream = await axios.get(data.url, {
             headers: data.headers, timeout: 15000, responseType: 'text',
-            transformResponse: [(d) => d], httpsAgent: ipv4Agent
+            transformResponse: [(d) => d]
         });
         const rewritten = rewriteM3u8(upstream.data, data.url, data.headers, data.full);
         res.set('Access-Control-Allow-Origin', '*');
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewritten);
     } catch (e) {
-        let host = '?'; try { host = new URL(data.url).host; } catch (_) {}
-        console.log(`[Proxy] playlist FALLÓ tras ${Date.now() - tp0}ms | host=${host} | status=${e.response ? e.response.status : 'sin respuesta'} | ${e.code || ''} ${e.message}`);
         res.status(502).send('No se pudo obtener el playlist: ' + e.message);
     }
 }
@@ -735,8 +819,6 @@ async function handleHlsSegmentProxy(req, res) {
 // directo al CDN y los headers los intenta mandar el cliente (ver proxyHeaders
 // más abajo).
 const PROXY_TXT = process.env.PROXY_TXT === '1';
-// VIDHIDE_DIRECT=0 para volver al comportamiento anterior (playlist por Render).
-const VIDHIDE_DIRECT = process.env.VIDHIDE_DIRECT !== '0';
 function buildProxyPlaylistUrl(targetUrl, headers) {
     const full = PROXY_TXT && /\.txt(\?|#|$)/i.test(targetUrl);
     const token = encodeProxyToken(targetUrl, headers, full);
@@ -803,10 +885,19 @@ async function resolveStreamsFor(type, id) {
     const embeds = await getDecryptedEmbeds(imdbId, season, episode);
     console.log(`[${Date.now() - t0}ms] Embeds descifrados: ${embeds.length} (${embeds.map(e => e.servername).join(', ')})`);
 
-    const ctx = { cancelled: false };
-    const streams = [];
-    const buildStream = (e, r) => {
-        console.log(`👉 [${e.servername}] Enlace a pasar al proxy: ${r.url} | Referer=${r.headers.Referer} Origin=${r.headers.Origin}`);
+    // Tope de respuesta: Stremio / AIOStreams descartan el addon si tarda de más
+    // (en el log de Render las respuestas tardaban ~58 s). Lo que no alcance a
+    // resolverse a tiempo sigue en segundo plano y queda en caché para el reintento.
+    const deadlineMs = parseInt(process.env.RESPONSE_DEADLINE_MS || '18000', 10);
+    let deadlineTimer;
+    const deadline = new Promise((resolve) => { deadlineTimer = setTimeout(() => resolve('deadline'), deadlineMs); });
+    let late = 0;
+    const resolved = await Promise.all(embeds.map(async (e) => {
+        const r0 = await Promise.race([resolveByServer(e.servername, e.embedUrl), deadline]);
+        const r = r0 === 'deadline' ? null : r0;
+        if (r0 === 'deadline') late++;
+        if (!r) return null;
+        console.log(`👉 [${e.servername}] (${r.via || 'browser'}) Enlace a pasar al proxy: ${r.url} | Referer=${r.headers.Referer} Origin=${r.headers.Origin}`);
         const stream = {
             name: `PelisPedia - ${e.servername}`,
             title: `${e.language} - ${e.servername}`,
@@ -815,48 +906,15 @@ async function resolveStreamsFor(type, id) {
         // Masters .txt (CDN de StreamWish en Cloudflare, CORS atado al origen del
         // embed): le pedimos a Stremio que mande Referer/Origin/UA desde el
         // cliente, sin pasar bytes por nuestro server.
-        if (VIDHIDE_DIRECT && e.servername === 'vidhide' && /\.m3u8(\?|#|$)/i.test(r.url) && r.headers) {
-            // Modo directo: Render no toca el playlist (axios desde Render se cuelga
-            // contra morencius); el cliente lo pide con Referer/Origin/UA.
-            // Headers como los manda el navegador en el trace de morencius: Referer = página
-            // del embed y User-Agent, SIN Origin (las peticiones del reproductor no lo llevan).
-            // Los segmentos (.image en tiktokcdn) son públicos y no necesitan nada especial.
-            stream.url = r.url;
-            stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: {
-                'Referer': r.headers.Referer,
-                'User-Agent': r.headers['User-Agent'] || PS_UA
-            } } };
-        } else if (/\.txt(\?|#|$)/i.test(r.url) && r.headers) {
+        if (/\.txt(\?|#|$)/i.test(r.url) && r.headers) {
             stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: { ...r.headers } } };
         }
         return stream;
-    };
+    }));
 
-    // Tope total y salida anticipada: no esperamos al Puppeteer lento si ya hay
-    // algo que mostrar. Stremio se rinde pronto; mejor 1-2 streams a tiempo.
-    const DEADLINE_MS = parseInt(process.env.RESOLVE_DEADLINE_MS || '35000', 10);
-    const GRACE_MS = parseInt(process.env.RESOLVE_GRACE_MS || '10000', 10);
-    await new Promise((resolveAll) => {
-        let pending = embeds.length;
-        let graceTimer = null;
-        const finish = () => { clearTimeout(hardTimer); if (graceTimer) clearTimeout(graceTimer); resolveAll(); };
-        const hardTimer = setTimeout(finish, DEADLINE_MS);
-        if (pending === 0) return finish();
-        embeds.forEach((e) => {
-            resolveByServer(e.servername, e.embedUrl, ctx)
-                .then((r) => {
-                    if (r && !ctx.cancelled) {
-                        streams.push(buildStream(e, r));
-                        if (!graceTimer) graceTimer = setTimeout(finish, GRACE_MS);
-                    }
-                })
-                .catch((err) => console.log(`[${e.servername}] Error resolviendo:`, err.message))
-                .finally(() => { if (--pending === 0) finish(); });
-        });
-    });
-    ctx.cancelled = true;   // los que sigan en la cola del navegador se saltan
-
-    console.log(`[${Date.now() - t0}ms] Streams resueltos: ${streams.length} (tiempo total de esta respuesta)`);
+    clearTimeout(deadlineTimer);
+    const streams = resolved.filter(Boolean);
+    console.log(`[${Date.now() - t0}ms] Streams resueltos: ${streams.length} (tiempo total de esta respuesta)${late ? ` -- ${late} siguen en curso, quedan en caché para el reintento` : ''}`);
     return streams;
 }
 
@@ -876,6 +934,39 @@ app.get('/debug/browsercheck', async (req, res) => {
     }
 });
 
+app.get('/debug/http', async (req, res) => {
+    const url = req.query.url;
+    if (!url) return res.status(400).send('Uso: /debug/http?url=<embed, p.ej. https://morencius.com/embed/XXXX>');
+    res.set('Content-Type', 'text/plain');
+    const out = [];
+    let id = null;
+    try { const m = new URL(url).pathname.match(/\/(?:embed|e|v)\/([A-Za-z0-9]+)/); if (m) id = m[1]; } catch (e) {}
+    const tests = [
+        // "viejo" = lo que hacía resolveVidHide antes (así se ve si el cambio de headers es lo que arregla)
+        { name: 'viejo (UA + Referer propio + defaults de axios)', url, headers: { 'User-Agent': PS_UA, 'Referer': `${new URL(url).origin}/` } },
+        { name: 'ld (laughing-dollop)', url, headers: HEADER_PROFILES.ld('https://www.google.com/') },
+        { name: 'iframe (Edge 133)', url, headers: HEADER_PROFILES.iframe(BASE + '/') }
+    ];
+    if (id && familyOf(url) === 'vidhide') {
+        for (const mirror of VIDHIDE_MIRRORS) tests.push({ name: 'espejo ' + mirror, url: `https://${mirror}/embed/${id}`, headers: HEADER_PROFILES.ld('https://filelions.to/') });
+    }
+    for (const t of tests) {
+        const t0 = Date.now();
+        const ac = new AbortController();
+        const kill = setTimeout(() => ac.abort(), 10000);
+        try {
+            const r = await axios.get(t.url, { headers: t.headers, timeout: 10000, signal: ac.signal, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true, maxRedirects: 5 });
+            const body = typeof r.data === 'string' ? r.data : '';
+            const pageUrl = (r.request && r.request.res && r.request.res.responseUrl) || t.url;
+            const picked = pickPreferredHls(`${unpackAllEvalBlocks(body)}\n${body}`, new URL(pageUrl).origin) || pickLegacyHls(body, new URL(pageUrl).origin);
+            out.push(`## ${t.name}\n   ${t.url}\n   status ${r.status} en ${Date.now() - t0}ms | server=${r.headers.server || '-'} cf-mitigated=${r.headers['cf-mitigated'] || '-'} largo=${body.length}\n   link: ${picked ? `[${picked.key}] ${picked.url}` : 'NO encontrado'}` + (picked ? '' : `\n   inicio del body: ${body.slice(0, 200).replace(/\s+/g, ' ')}`));
+        } catch (e) {
+            out.push(`## ${t.name}\n   ${t.url}\n   ERROR tras ${Date.now() - t0}ms: ${e.message}`);
+        } finally { clearTimeout(kill); }
+    }
+    res.send(out.join('\n\n'));
+});
+
 app.get('/debug/resolve', async (req, res) => {
     const { server, url, force } = req.query;
     if (!server || !url) return res.status(400).send('Uso: /debug/resolve?server=streamwish&url=<embed>&force=browser (force es opcional)');
@@ -884,7 +975,10 @@ app.get('/debug/resolve', async (req, res) => {
     const t0 = Date.now();
     try {
         let result;
-        if (force === 'browser') {
+        if (force === 'http') {
+            log.push('Forzando solo el camino HTTP (sin navegador)...');
+            result = await resolveViaHttp(url);
+        } else if (force === 'browser') {
             log.push('Forzando resolución vía navegador (saltando el método rápido)...');
             result = await resolveViaBrowser(url);
         } else {
@@ -895,71 +989,6 @@ app.get('/debug/resolve', async (req, res) => {
         log.push(`EXCEPCIÓN: ${e.message}\n${e.stack}`);
     }
     res.send(log.join('\n'));
-});
-
-// Diagnóstico de vidhide desde Render: resuelve el embed con el navegador y luego
-// prueba, con axios (como lo haría el proxy), master -> playlist -> primer segmento.
-// Uso: /debug/vidhide?url=https://morencius.com/embed/XXXX
-app.get('/debug/vidhide', async (req, res) => {
-    const embed = req.query.url;
-    if (!embed) return res.status(400).send('Uso: /debug/vidhide?url=<embed de morencius u otro vidhide>');
-    res.set('Content-Type', 'text/plain');
-    const out = [];
-    const t0 = Date.now();
-    const p = (m) => out.push(`[${Date.now() - t0}ms] ${m}`);
-    try {
-        p('Resolviendo con navegador...');
-        const r = await resolveViaBrowser(embed, 40000, null, true);
-        if (!r) { p('El navegador devolvió null.'); return res.send(out.join('\n')); }
-        p(`URL: ${r.url}`);
-        p(`Headers: ${JSON.stringify(r.headers)}`);
-        const hdrs = Object.entries(r.headers).map(([k, v]) => `-H '${k}: ${v}'`).join(' ');
-        p(`Para probar desde TU red (si esto da 200 en tu PC pero 403 aquí, el token está atado a IP):\n    curl -i ${hdrs} '${r.url}'`);
-
-        const get = async (label, url, agent, extra) => {
-            const t = Date.now();
-            try {
-                const cfg = { headers: { ...r.headers, ...(extra || {}) }, timeout: 10000, responseType: 'text',
-                              transformResponse: [(d) => d], validateStatus: () => true };
-                if (agent) cfg.httpsAgent = agent;
-                const x = await axios.get(url, cfg);
-                p(`${label}: status ${x.status} en ${Date.now() - t}ms | content-type=${x.headers['content-type']} | ${String(x.data).slice(0, 160).replace(/\n/g, ' ⏎ ')}`);
-                return x;
-            } catch (e) {
-                p(`${label}: FALLÓ tras ${Date.now() - t}ms | ${e.code || ''} ${e.message}`);
-                return null;
-            }
-        };
-        let master = await get('MASTER (IPv4)', r.url, ipv4Agent);
-        const master2 = await get('MASTER (default)', r.url, undefined);
-        master = master || master2;
-        const firstLine = (txt) => String(txt || '').split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#'));
-        if (master && master.status === 200) {
-            const variantRel = firstLine(master.data);
-            if (variantRel) {
-                const variantUrl = new URL(variantRel, r.url).toString();
-                p(`Variante: ${variantUrl}`);
-                const v = await get('VARIANTE', variantUrl, ipv4Agent);
-                if (v && v.status === 200) {
-                    const segRel = firstLine(v.data);
-                    if (segRel) {
-                        const segUrl = new URL(segRel, variantUrl).toString();
-                        p(`Primer segmento: ${segUrl}`);
-                        const t = Date.now();
-                        try {
-                            const sg = await axios.get(segUrl, { headers: { ...r.headers, Range: 'bytes=0-1023' }, timeout: 10000,
-                                responseType: 'stream', validateStatus: () => true, httpsAgent: ipv4Agent });
-                            p(`SEGMENTO: status ${sg.status} en ${Date.now() - t}ms | content-type=${sg.headers['content-type']} | cors=${sg.headers['access-control-allow-origin'] || '(ninguno)'}`);
-                            sg.data.destroy();
-                        } catch (e) { p(`SEGMENTO: FALLÓ tras ${Date.now() - t}ms | ${e.code || ''} ${e.message}`); }
-                    }
-                }
-            }
-        }
-    } catch (e) {
-        p(`EXCEPCIÓN: ${e.message}`);
-    }
-    res.send(out.join('\n'));
 });
 
 app.get('/debug/embeds', async (req, res) => {
@@ -1020,7 +1049,7 @@ app.get('/debug/adcheck', async (req, res) => {
             if (!t || t.startsWith('#')) continue;
             const abs = /^https?:\/\//i.test(t) ? t : makeAbsoluteUrl(t, subLine.replace(/\/[^/]*$/, ''));
             total++;
-            if (looksLikeAdUrl(abs)) { ads++; if (sampleAds.length < 3) sampleAds.push(abs); }
+            if (isKnownAdHost(abs)) { ads++; if (sampleAds.length < 3) sampleAds.push(abs); }
             else { if (sampleReal.length < 3) sampleReal.push(abs); }
         }
         res.send(
